@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 import openpyxl
 from openpyxl.drawing.image import Image as XLImage
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageOps
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib import colors
@@ -265,7 +265,7 @@ ACTIVIDADES_TRABAJO = [
     "Control de vegetación y retiro de desechos",
 ]
 
-UNIDADES_TRABAJO = ["ml", "un", "m3", "gl", "km", "hrs"]
+UNIDADES_TRABAJO = ["ml", "un", "m3", "km"]
 
 EQUIPOS_CATALOGO = [
     "Cortadora de Rieles", "Generador Eléctrico", "Llave de Impacto", "Motosierra", "Taladro Industrial",
@@ -506,6 +506,20 @@ def generar_pdf_reporte(resumen: dict) -> bytes:
 
     doc.build(el)
     return buf.getvalue()
+
+def generar_documentos_reporte(resumen: dict):
+    """Genera el Excel y PDF individuales. Si una foto hace fallar la incrustación
+    (formatos raros de cámara que a veces se cuelan), reintenta sin fotos para que
+    el reporte —ya guardado en el libro maestro— nunca se pierda por esto."""
+    try:
+        excel_bytes = generar_excel_reporte(resumen)
+    except Exception:
+        excel_bytes = generar_excel_reporte({**resumen, "fotos": []})
+    try:
+        pdf_bytes = generar_pdf_reporte(resumen)
+    except Exception:
+        pdf_bytes = generar_pdf_reporte({**resumen, "fotos": []})
+    return excel_bytes, pdf_bytes
 
 # -------------------------
 # Perfiles / roles
@@ -1009,11 +1023,22 @@ def guardar_reporte(grupo_via, fecha_reporte, observaciones, fotos_subidas):
     if fotos_subidas:
         carpeta_fotos = os.path.join(FOTOS_DIR, reporte_id)
         os.makedirs(carpeta_fotos, exist_ok=True)
-        for foto in fotos_subidas:
-            ruta = os.path.join(carpeta_fotos, foto.name)
-            with open(ruta, "wb") as f:
-                f.write(foto.getbuffer())
-            fotos_guardadas.append((foto.name, ruta))
+        for idx, foto in enumerate(fotos_subidas, start=1):
+            nombre_final = f"foto_{idx:02d}.jpg"
+            ruta = os.path.join(carpeta_fotos, nombre_final)
+            try:
+                # Normaliza a JPEG estándar: los celulares suelen entregar formatos
+                # (MPO, HEIC, etc.) que PIL abre pero openpyxl no sabe incrustar al guardar.
+                img = PILImage.open(foto)
+                img = ImageOps.exif_transpose(img)
+                img = img.convert("RGB")
+                img.save(ruta, format="JPEG", quality=85)
+            except Exception:
+                nombre_final = foto.name
+                ruta = os.path.join(carpeta_fotos, nombre_final)
+                with open(ruta, "wb") as f:
+                    f.write(foto.getbuffer())
+            fotos_guardadas.append((nombre_final, ruta))
     fotos_rows = [[reporte_id, nombre, ruta] for nombre, ruta in fotos_guardadas]
 
     guardar_reporte_excel(reporte_row, trabajos_rows, equipos_rows, materiales_rows, asistencia_rows, fotos_rows)
@@ -1037,8 +1062,7 @@ def guardar_reporte(grupo_via, fecha_reporte, observaciones, fotos_subidas):
     )
     resumen["aviso_id"] = crear_aviso_desde_reporte(reporte_id, grupo_via, resumen_texto)
 
-    excel_bytes = generar_excel_reporte(resumen)
-    pdf_bytes = generar_pdf_reporte(resumen)
+    excel_bytes, pdf_bytes = generar_documentos_reporte(resumen)
 
     return {"ok": True, "msg": f"Reporte {reporte_id} guardado ✅", "resumen": resumen,
             "excel_bytes": excel_bytes, "pdf_bytes": pdf_bytes}
