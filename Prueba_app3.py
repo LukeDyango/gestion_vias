@@ -3,6 +3,8 @@ import pandas as pd
 import sqlite3
 import os
 import io
+import json
+import base64
 import uuid
 from datetime import datetime
 import openpyxl
@@ -1102,6 +1104,77 @@ def page_generar_reporte():
         else:
             st.error(resultado["msg"])
 
+def render_boton_compartir_excel(excel_bytes: bytes, reporte_id: str, resumen: dict):
+    """Boton que abre el panel nativo de 'Compartir' del celular (Correo, Gmail, WhatsApp, etc.)
+    con el Excel del reporte ya adjunto. No requiere configurar ningun correo ni servidor propio."""
+    b64 = base64.b64encode(excel_bytes).decode("utf-8")
+    file_name = f"Reporte_{reporte_id}.xlsx"
+    asunto = f"Reporte Diario {reporte_id} - Grupo Via {resumen['grupo_via']} - {resumen['fecha']}"
+    cuerpo = (
+        f"Se adjunta el Reporte Diario {reporte_id} del Grupo Via {resumen['grupo_via']}, "
+        f"correspondiente al {resumen['fecha']}, generado por {resumen['usuario']}."
+    )
+
+    html_template = """
+    <div style="font-family: -apple-system, sans-serif;">
+      <button id="btnCompartirReporte" style="
+          width:100%; padding:0.65rem 1rem; border-radius:10px; font-weight:600;
+          background:#2FA84F; color:#fff; border:none; font-size:15px; cursor:pointer;">
+        📤 Enviar / Compartir Excel
+      </button>
+      <p id="compartirStatus" style="font-size:12.5px; color:#888; margin-top:6px; min-height:16px;"></p>
+    </div>
+    <script>
+    (function () {
+      const b64Data = "__B64DATA__";
+      const fileName = __FILENAME_JSON__;
+      const subject = __SUBJECT_JSON__;
+      const bodyText = __BODY_JSON__;
+
+      const btn = document.getElementById('btnCompartirReporte');
+      const statusEl = document.getElementById('compartirStatus');
+
+      btn.addEventListener('click', async function () {
+        statusEl.textContent = 'Preparando archivo...';
+        try {
+          const byteChars = atob(b64Data);
+          const byteNumbers = new Array(byteChars.length);
+          for (let i = 0; i < byteChars.length; i++) {
+            byteNumbers[i] = byteChars.charCodeAt(i);
+          }
+          const byteArray = new Uint8Array(byteNumbers);
+          const file = new File([byteArray], fileName, {
+            type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+          });
+
+          if (navigator.canShare && navigator.canShare({ files: [file] })) {
+            await navigator.share({ files: [file], title: subject, text: bodyText });
+            statusEl.textContent = 'Compartido';
+          } else {
+            statusEl.textContent = 'Este navegador no permite adjuntar directo. Se abrira tu correo: adjunta el Excel a mano (boton Descargar Excel de arriba).';
+            window.location.href = 'mailto:?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(bodyText);
+          }
+        } catch (err) {
+          if (err && err.name === 'AbortError') {
+            statusEl.textContent = 'Cancelado.';
+          } else {
+            statusEl.textContent = 'No se pudo compartir: ' + (err && err.message ? err.message : err);
+          }
+        }
+      });
+    })();
+    </script>
+    """
+
+    html_code = (
+        html_template
+        .replace("__B64DATA__", b64)
+        .replace("__FILENAME_JSON__", json.dumps(file_name))
+        .replace("__SUBJECT_JSON__", json.dumps(asunto))
+        .replace("__BODY_JSON__", json.dumps(cuerpo))
+    )
+    st.iframe(html_code, height=90)
+
 def page_reporte_guardado():
     app_header("Reporte Guardado", back_page="Inicio")
     perfil_bar()
@@ -1139,6 +1212,14 @@ def page_reporte_guardado():
             file_name=f"Reporte_{resumen['reporte_id']}.pdf", mime="application/pdf",
             key="btn_descargar_pdf", use_container_width=True,
         )
+
+    st.divider()
+    st.markdown("#### Enviar por correo")
+    render_boton_compartir_excel(st.session_state.last_reporte_excel, resumen["reporte_id"], resumen)
+    st.caption(
+        "Abre el panel de Compartir del celular (Correo, Gmail, WhatsApp, etc.) con el Excel ya adjunto. "
+        "Si el navegador no lo permite, se abrirá el correo sin adjunto — usa el botón Descargar Excel de arriba y adjúntalo a mano."
+    )
 
     st.divider()
     st.info(
