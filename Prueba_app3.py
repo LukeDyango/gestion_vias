@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime
 import openpyxl
 from openpyxl.drawing.image import Image as XLImage
+from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage, ImageOps
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
@@ -160,27 +161,6 @@ def init_db():
         if col not in cols_existentes:
             c.execute(f"ALTER TABLE avisos ADD COLUMN {col} {decl}")
 
-    if c.execute("SELECT COUNT(*) FROM activos").fetchone()[0] == 0:
-        c.executemany("INSERT INTO activos VALUES (?,?,?,?)", [
-            ("MF177-01", "Bus MF-177", "Malloco", "Material Rodante"),
-            ("MF177-02", "Bus MF-177", "Estación Central", "Material Rodante"),
-            ("VIA-KM23", "Vía km 23.400", "Vía KM 23.400", "Vía"),
-            ("DESV-010-A", "Desviador A", "Talagante", "Desviador"),
-        ])
-    if c.execute("SELECT COUNT(*) FROM avisos").fetchone()[0] == 0:
-        placeholders = ",".join(["?"] * len(AVISO_COLUMNS))
-        c.executemany(f"INSERT INTO avisos ({','.join(AVISO_COLUMNS)}) VALUES ({placeholders})", [
-            ("EFE-00021", "Bus MF-177 - Malloco", "Túnel interior Malloco", "Alta", "Falla eléctrica",
-             "2026-06-30 10:05", "Averia en sistema eléctrico, luces de cabina no funcionan.", "", "Luis (Terreno)", "Personal Terreno",
-             "Nuevo", 0, "Sacyr", "EFE", "",
-             0, "", "", "", 0, "", "", "", 0, "", "", "",
-             0, "", "", ""),
-            ("EFE-00020", "Bus MF-177 - Estación Central", "Estación Central", "Media", "Otro",
-             "2026-06-30 09:30", "Maletín olvidado en el andén sur. Retirar.", "", "Ana (Terreno)", "Personal Terreno",
-             "Nuevo", 0, "Sacyr", "EFE", "",
-             0, "", "", "", 0, "", "", "", 0, "", "", "",
-             0, "", "", ""),
-        ])
     conn.commit()
     conn.close()
 
@@ -227,7 +207,7 @@ REPORTES_XLSX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "r
 FOTOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fotos_reportes")
 
 REPORTES_SHEETS = {
-    "Reportes": ["ReporteID", "Fecha", "GrupoVia", "Usuario", "Observaciones", "FechaCreacion"],
+    "Reportes": ["ReporteID", "Fecha", "GrupoVia", "Usuario", "Observaciones", "FechaCreacion", "Ubicacion"],
     "Trabajos": ["ReporteID", "Actividad", "KmDesde", "KmHasta", "Unidad", "Cantidad", "Hombres", "HH"],
     "Equipos": ["ReporteID", "Equipo", "Cantidad"],
     "Materiales": ["ReporteID", "Material", "Cantidad", "Estado"],
@@ -375,6 +355,38 @@ def _resolver_nombre(item: dict) -> str:
         return item.get("nombre_custom", "").strip() or "Otro"
     return item["nombre"]
 
+# Encabezados del resumen "plano" (una fila por actividad; Equipo/Materiales/Fotos-Observación/
+# Asistencia van cada uno en una sola celda, con sus varios valores separados por coma).
+FLAT_HEADERS = [
+    "Grupo Vía", "Jefe de Grupo", "Fecha", "Ubicación", "Trabajo Realizado", "Km Desde", "Km Hasta",
+    "Unidad", "Cantidad", "Horas Trabajadas", "Equipo Utilizado", "Materiales",
+    "Fotos / Observación", "Asistencia",
+]
+FLAT_COL_WIDTHS = [12, 18, 12, 25, 30, 10, 10, 8, 10, 14, 30, 30, 35, 35]
+
+def _texto_equipos(equipos) -> str:
+    return ", ".join(f"{e['nombre']} ({e['cantidad']:.0f})" for e in equipos) or "—"
+
+def _texto_materiales(materiales) -> str:
+    return ", ".join(
+        f"{_resolver_nombre(m)} ({m['cantidad']:.0f}, {m.get('estado', '') or '—'})" for m in materiales
+    ) or "—"
+
+def _texto_fotos_obs(fotos, observaciones) -> str:
+    partes = []
+    if fotos:
+        partes.append("Fotos: " + ", ".join(nombre for nombre, _ in fotos))
+    if observaciones and str(observaciones).strip():
+        partes.append(f"Obs: {observaciones}")
+    return " | ".join(partes) or "—"
+
+def _texto_asistencia(asistencia) -> str:
+    return ", ".join(f"{a['nombre']} ({a['cargo']}) - {a['estado']}" for a in asistencia) or "—"
+
+def _ajustar_anchos_columnas(ws, anchos):
+    for i, ancho in enumerate(anchos, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = ancho
+
 def _tabla_pdf(data):
     if len(data) <= 1:
         data.append(["—"] * len(data[0]))
@@ -390,48 +402,29 @@ def _tabla_pdf(data):
     return t
 
 def generar_excel_reporte(resumen: dict) -> bytes:
-    """Genera un Excel individual (no el libro maestro) con todo lo capturado en un Reporte Diario."""
+    """Genera un Excel individual (no el libro maestro): una fila por actividad, con Equipo,
+    Materiales, Fotos/Observación y Asistencia condensados cada uno en una sola celda."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Reporte"
-    ws.append(["Reporte Diario", resumen["reporte_id"]])
-    ws.append(["Fecha", resumen["fecha"]])
-    ws.append(["Grupo Vía", resumen["grupo_via"]])
-    ws.append(["Usuario", resumen["usuario"]])
-    ws.append(["Jornada estándar (h/trabajador)", resumen["horas_dia"]])
-    ws.append([])
 
-    ws.append(["TRABAJOS"])
-    ws.append(["Actividad", "Km Desde", "Km Hasta", "Unidad", "Cantidad", "N° Trabajadores", "HH"])
+    equipo_txt = _texto_equipos(resumen["equipos"])
+    material_txt = _texto_materiales(resumen["materiales"])
+    fotos_obs_txt = _texto_fotos_obs(resumen["fotos"], resumen["observaciones"])
+    asistencia_txt = _texto_asistencia(resumen["asistencia"])
+
+    ws.append(FLAT_HEADERS)
     for t in resumen["trabajos"]:
-        ws.append([t["actividad"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hombres"], t["hh"]])
-    ws.append([])
-
-    ws.append(["EQUIPOS"])
-    ws.append(["Equipo", "Cantidad"])
-    for e in resumen["equipos"]:
-        ws.append([e["nombre"], e["cantidad"]])
-    ws.append([])
-
-    ws.append(["MATERIALES"])
-    ws.append(["Material", "Cantidad", "Estado"])
-    for m in resumen["materiales"]:
-        ws.append([_resolver_nombre(m), m["cantidad"], m.get("estado", "")])
-    ws.append([])
-
-    ws.append(["OBSERVACIONES"])
-    ws.append([resumen["observaciones"] or "—"])
-    ws.append([])
-
-    ws.append(["ASISTENCIA"])
-    ws.append(["Trabajador", "Cargo", "Estado"])
-    for a in resumen["asistencia"]:
-        ws.append([a["nombre"], a["cargo"], a["estado"]])
+        ws.append([
+            resumen["grupo_via"], resumen["usuario"], resumen["fecha"], resumen.get("ubicacion") or "—",
+            t["actividad"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hh"],
+            equipo_txt, material_txt, fotos_obs_txt, asistencia_txt,
+        ])
+    _ajustar_anchos_columnas(ws, FLAT_COL_WIDTHS)
 
     if resumen["fotos"]:
-        ws.append([])
-        ws.append(["FOTOGRAFÍAS"])
-        fila = ws.max_row + 1
+        fila = ws.max_row + 3
+        ws.cell(row=fila - 1, column=1, value="FOTOGRAFÍAS")
         for nombre, ruta in resumen["fotos"]:
             try:
                 img = XLImage(ruta)
@@ -439,7 +432,8 @@ def generar_excel_reporte(resumen: dict) -> bytes:
                 ws.add_image(img, f"A{fila}")
                 fila += 13
             except Exception:
-                ws.append([f"(No se pudo incrustar: {nombre})"])
+                ws.cell(row=fila, column=1, value=f"(No se pudo incrustar: {nombre})")
+                fila += 1
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -453,10 +447,11 @@ def generar_pdf_reporte(resumen: dict) -> bytes:
     el = []
     el.append(Paragraph(f"Reporte Diario {resumen['reporte_id']}", styles["Title"]))
     el.append(Paragraph(
-        f"Grupo Vía: {resumen['grupo_via']} · Fecha: {resumen['fecha']} · Usuario: {resumen['usuario']} · "
+        f"Grupo Vía: {resumen['grupo_via']} · Fecha: {resumen['fecha']} · Jefe de Grupo: {resumen['usuario']} · "
         f"Jornada: {resumen['horas_dia']} h/trabajador",
         styles["Normal"],
     ))
+    el.append(Paragraph(f"Ubicación: {resumen.get('ubicacion') or '—'}", styles["Normal"]))
     el.append(Spacer(1, 12))
 
     el.append(Paragraph("Trabajos", styles["Heading2"]))
@@ -521,6 +516,145 @@ def generar_documentos_reporte(resumen: dict):
         pdf_bytes = generar_pdf_reporte({**resumen, "fotos": []})
     return excel_bytes, pdf_bytes
 
+def generar_respaldo_plano() -> bytes | None:
+    """Resumen legible de TODO el histórico (todas las actividades de todos los Reportes Diarios
+    guardados hasta ahora): una fila por actividad, con Equipo/Materiales/Fotos-Observación/
+    Asistencia condensados cada uno en una sola celda. El libro maestro (reportes_diarios.xlsx)
+    sigue normalizado en hojas separadas para Power BI; esto es solo una vista aparte para leer rápido."""
+    if not os.path.exists(REPORTES_XLSX_PATH):
+        return None
+    try:
+        df_rep = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Reportes")
+        df_trab = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Trabajos")
+        df_equ = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Equipos")
+        df_mat = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Materiales")
+        df_asi = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Asistencia")
+        df_fot = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Fotos")
+    except Exception:
+        return None
+    if df_rep.empty:
+        return None
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Resumen"
+    ws.append(FLAT_HEADERS)
+
+    for _, rep in df_rep.iterrows():
+        rid = rep["ReporteID"]
+        trabajos_rep = df_trab[df_trab["ReporteID"] == rid]
+        if trabajos_rep.empty:
+            continue
+
+        equipo_txt = ", ".join(
+            f"{r['Equipo']} ({r['Cantidad']:.0f})" for _, r in df_equ[df_equ["ReporteID"] == rid].iterrows()
+        ) or "—"
+        material_txt = ", ".join(
+            f"{r['Material']} ({r['Cantidad']:.0f}, {r.get('Estado') or '—'})"
+            for _, r in df_mat[df_mat["ReporteID"] == rid].iterrows()
+        ) or "—"
+        fotos_lista = df_fot[df_fot["ReporteID"] == rid]["NombreArchivo"].tolist()
+        partes_fo = []
+        if fotos_lista:
+            partes_fo.append("Fotos: " + ", ".join(fotos_lista))
+        obs = rep.get("Observaciones")
+        if isinstance(obs, str) and obs.strip():
+            partes_fo.append(f"Obs: {obs}")
+        fotos_obs_txt = " | ".join(partes_fo) or "—"
+        asistencia_txt = ", ".join(
+            f"{r['Trabajador']} ({r['Cargo']}) - {r['Estado']}" for _, r in df_asi[df_asi["ReporteID"] == rid].iterrows()
+        ) or "—"
+
+        ubicacion = rep.get("Ubicacion")
+        ubicacion_txt = ubicacion if isinstance(ubicacion, str) and ubicacion.strip() else "—"
+
+        for _, t in trabajos_rep.iterrows():
+            ws.append([
+                rep["GrupoVia"], rep["Usuario"], rep["Fecha"], ubicacion_txt,
+                t["Actividad"], t["KmDesde"], t["KmHasta"], t["Unidad"], t["Cantidad"], t["HH"],
+                equipo_txt, material_txt, fotos_obs_txt, asistencia_txt,
+            ])
+
+    _ajustar_anchos_columnas(ws, FLAT_COL_WIDTHS)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+def mostrar_detalle_reporte_diario(reporte_id: str):
+    """Vista de solo lectura de un Reporte Diario, para que el validador vea exactamente
+    lo que ingresó Personal de Terreno (sin poder editarlo desde acá)."""
+    if not os.path.exists(REPORTES_XLSX_PATH):
+        st.info("No se encontró el archivo de Reportes Diarios.")
+        return
+    try:
+        df_rep = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Reportes")
+        df_trab = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Trabajos")
+        df_equ = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Equipos")
+        df_mat = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Materiales")
+        df_asi = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Asistencia")
+        df_fot = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Fotos")
+    except Exception:
+        st.info("No se pudo leer el Reporte Diario.")
+        return
+
+    fila_rep = df_rep[df_rep["ReporteID"] == reporte_id]
+    if fila_rep.empty:
+        st.info("Este Reporte Diario ya no está disponible (puede haberse limpiado el respaldo).")
+        return
+    rep = fila_rep.iloc[0]
+
+    st.caption(f"📄 Reporte {reporte_id} · Grupo Vía {rep['GrupoVia']} · {rep['Fecha']} · Jefe de Grupo: {rep['Usuario']}")
+    ubicacion = rep.get("Ubicacion")
+    if isinstance(ubicacion, str) and ubicacion.strip():
+        st.caption(f"📍 Ubicación: {ubicacion}")
+
+    st.markdown("**🛠️ Trabajos**")
+    trabajos_rep = df_trab[df_trab["ReporteID"] == reporte_id].drop(columns=["ReporteID"])
+    if not trabajos_rep.empty:
+        st.dataframe(trabajos_rep, hide_index=True, width="stretch")
+    else:
+        st.caption("Sin actividades registradas.")
+
+    st.markdown("**🚜 Equipos**")
+    equipos_rep = df_equ[df_equ["ReporteID"] == reporte_id].drop(columns=["ReporteID"])
+    if not equipos_rep.empty:
+        st.dataframe(equipos_rep, hide_index=True, width="stretch")
+    else:
+        st.caption("Sin equipos registrados.")
+
+    st.markdown("**📦 Materiales**")
+    materiales_rep = df_mat[df_mat["ReporteID"] == reporte_id].drop(columns=["ReporteID"])
+    if not materiales_rep.empty:
+        st.dataframe(materiales_rep, hide_index=True, width="stretch")
+    else:
+        st.caption("Sin materiales registrados.")
+
+    st.markdown("**👷 Asistencia**")
+    asistencia_rep = df_asi[df_asi["ReporteID"] == reporte_id]
+    if not asistencia_rep.empty:
+        st.dataframe(asistencia_rep[["Trabajador", "Cargo", "Estado"]], hide_index=True, width="stretch")
+    else:
+        st.caption("Sin asistencia registrada.")
+
+    st.markdown("**📝 Observaciones**")
+    obs = rep.get("Observaciones")
+    st.write(obs if isinstance(obs, str) and obs.strip() else "—")
+
+    st.markdown("**📷 Fotografías**")
+    fotos_rep = df_fot[df_fot["ReporteID"] == reporte_id]
+    if not fotos_rep.empty:
+        cols = st.columns(2)
+        for i, (_, f) in enumerate(fotos_rep.iterrows()):
+            ruta = f["RutaArchivo"]
+            with cols[i % 2]:
+                if isinstance(ruta, str) and os.path.exists(ruta):
+                    st.image(ruta, caption=f["NombreArchivo"], width="stretch")
+                else:
+                    st.caption(f"(No disponible: {f['NombreArchivo']})")
+    else:
+        st.caption("Sin fotografías.")
+
 # -------------------------
 # Perfiles / roles
 # -------------------------
@@ -567,6 +701,10 @@ def init_data():
         st.session_state.asistencia_form_counter = 0
     if "reporte_fotos_counter" not in st.session_state:
         st.session_state.reporte_fotos_counter = 0
+    if "rep_ubicacion_gps" not in st.session_state:
+        st.session_state.rep_ubicacion_gps = ""
+    if "ubicacion_texto_counter" not in st.session_state:
+        st.session_state.ubicacion_texto_counter = 0
     if "aviso_form_counter" not in st.session_state:
         st.session_state.aviso_form_counter = 0
     if "last_reporte" not in st.session_state:
@@ -621,6 +759,8 @@ def reset_reporte_form():
     st.session_state.reporte_materiales = []
     st.session_state.reporte_asistencia = []
     st.session_state.reporte_fotos_counter += 1
+    st.session_state.rep_ubicacion_gps = ""
+    st.session_state.ubicacion_texto_counter += 1
 
 def elapsed_str(fecha_hora_str: str) -> str:
     try:
@@ -775,7 +915,11 @@ def page_crear_aviso(title="Crear Aviso"):
     else:
         activos_df = st.session_state.activos
         activos_list = (activos_df["CodigoActivo"] + " - " + activos_df["NombreActivo"]).tolist()
-        activo = st.selectbox("Activo", activos_list, key=f"aviso_activo_{counter}")
+        if activos_list:
+            activo = st.selectbox("Activo", activos_list, key=f"aviso_activo_{counter}")
+        else:
+            st.caption("Aún no hay activos registrados en el catálogo.")
+            activo = st.text_input("Activo", key=f"aviso_activo_{counter}", placeholder="Escribe el activo o ubicación...")
 
     ubicacion = st.text_input("Ubicación", placeholder="Ej: Andén sur / Túnel interior...", key=f"aviso_ubic_{counter}")
     prioridad = st.selectbox("Prioridad", ["Baja", "Media", "Alta", "Crítica"], index=2, key=f"aviso_prio_{counter}")
@@ -824,6 +968,68 @@ def render_aviso_row(row):
 # =========================================================
 # Reporte Diario (Personal Terreno)
 # =========================================================
+def render_captura_ubicacion() -> str:
+    """Ubicación donde se hace el reporte: por GPS del celular o escrita a mano. Devuelve el texto final."""
+    modo = st.radio(
+        "¿Cómo quieres registrar la ubicación?",
+        ["📍 Usar GPS del celular", "✏️ Escribir descripción"],
+        key="rep_ubicacion_modo", horizontal=True,
+    )
+
+    if modo == "📍 Usar GPS del celular":
+        qp = st.query_params
+        if "lat" in qp and "lon" in qp:
+            st.session_state.rep_ubicacion_gps = f"{qp['lat']}, {qp['lon']} (GPS)"
+            st.query_params.clear()
+
+        if st.session_state.rep_ubicacion_gps:
+            st.success(f"📍 {st.session_state.rep_ubicacion_gps}")
+            if st.button("🔄 Volver a capturar", key="btn_gps_recapturar"):
+                st.session_state.rep_ubicacion_gps = ""
+                st.rerun()
+            return st.session_state.rep_ubicacion_gps
+
+        html_gps = """
+        <div style="font-family: -apple-system, sans-serif;">
+          <button id="btnGPS" style="
+              width:100%; padding:0.65rem 1rem; border-radius:10px; font-weight:600;
+              background:#0B3B8A; color:#fff; border:none; font-size:15px; cursor:pointer;">
+            📍 Obtener mi ubicación actual
+          </button>
+          <p id="gpsStatus" style="font-size:12.5px; color:#888; margin-top:6px; min-height:16px;"></p>
+        </div>
+        <script>
+        (function () {
+          const btn = document.getElementById('btnGPS');
+          const statusEl = document.getElementById('gpsStatus');
+          btn.addEventListener('click', function () {
+            if (!navigator.geolocation) {
+              statusEl.textContent = 'Este navegador no soporta geolocalización. Usa la opción de texto.';
+              return;
+            }
+            statusEl.textContent = 'Obteniendo ubicación... acepta el permiso si tu navegador lo pide.';
+            navigator.geolocation.getCurrentPosition(function (pos) {
+              const lat = pos.coords.latitude.toFixed(6);
+              const lon = pos.coords.longitude.toFixed(6);
+              const url = new URL(window.parent.location.href);
+              url.searchParams.set('lat', lat);
+              url.searchParams.set('lon', lon);
+              window.parent.location.href = url.toString();
+            }, function (err) {
+              statusEl.textContent = 'No se pudo obtener la ubicación: ' + err.message + '. Usa la opción de texto.';
+            }, { enableHighAccuracy: true, timeout: 10000 });
+          });
+        })();
+        </script>
+        """
+        st.iframe(html_gps, height=90)
+        return ""
+    else:
+        return st.text_input(
+            "Descripción de la ubicación", key=f"rep_ubicacion_texto_{st.session_state.ubicacion_texto_counter}",
+            placeholder="Ej: Km 23.400, cerca de la estación Malloco...",
+        )
+
 def render_trabajos_section():
     if not st.session_state.reporte_trabajos:
         st.caption("Aún no hay actividades agregadas.")
@@ -964,13 +1170,13 @@ def render_asistencia_section():
                 st.session_state.reporte_asistencia.pop(idx)
                 st.rerun()
 
-def crear_aviso_desde_reporte(reporte_id: str, grupo_via: str, resumen_texto: str) -> str:
+def crear_aviso_desde_reporte(reporte_id: str, grupo_via: str, ubicacion: str, resumen_texto: str) -> str:
     """Al guardar un Reporte Diario, se levanta automáticamente un aviso para que lo validen
     Sacyr, la ITO y el Supervisor del Subcontrato (esta app es de uso exclusivo para Icafal)."""
     aviso_id = next_aviso_id()
     new_row = {
         "AvisoID": aviso_id, "Activo": f"Reporte Diario · Grupo Vía {grupo_via}",
-        "Ubicacion": f"Grupo Vía {grupo_via}", "Prioridad": "Media", "Tipificacion": "Reporte Diario",
+        "Ubicacion": ubicacion or f"Grupo Vía {grupo_via}", "Prioridad": "Media", "Tipificacion": "Reporte Diario",
         "FechaHora": now_str(), "Descripcion": resumen_texto, "Adjunto": "",
         "CreadoPor": st.session_state.usuario, "RolCreador": "Personal Terreno",
         "Estado": "Nuevo", "OT_Creada": False,
@@ -993,7 +1199,7 @@ def equipos_seleccionados():
     seleccion += [{"nombre": o["nombre"], "cantidad": o["cantidad"]} for o in st.session_state.reporte_equipos_otros]
     return seleccion
 
-def guardar_reporte(grupo_via, fecha_reporte, observaciones, fotos_subidas):
+def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_subidas):
     trabajos = st.session_state.reporte_trabajos
     if not trabajos:
         return {"ok": False, "msg": "Agrega al menos una actividad en la sección Trabajos antes de guardar."}
@@ -1001,7 +1207,7 @@ def guardar_reporte(grupo_via, fecha_reporte, observaciones, fotos_subidas):
     reporte_id = next_reporte_id()
     horas_dia = horas_jornada_por_fecha(fecha_reporte)
     fecha_str = fecha_reporte.strftime("%Y-%m-%d")
-    reporte_row = [reporte_id, fecha_str, grupo_via, st.session_state.usuario, observaciones or "", now_str()]
+    reporte_row = [reporte_id, fecha_str, grupo_via, st.session_state.usuario, observaciones or "", now_str(), ubicacion or ""]
 
     trabajos_calc = [{**t, "hh": t["hombres"] * horas_dia} for t in trabajos]
     trabajos_rows = [
@@ -1046,7 +1252,7 @@ def guardar_reporte(grupo_via, fecha_reporte, observaciones, fotos_subidas):
     resumen = {
         "reporte_id": reporte_id, "fecha": fecha_str, "grupo_via": grupo_via,
         "usuario": st.session_state.usuario, "horas_dia": horas_dia,
-        "observaciones": observaciones or "",
+        "ubicacion": ubicacion or "", "observaciones": observaciones or "",
         "trabajos": trabajos_calc,
         "equipos": equipos_usados,
         "materiales": list(st.session_state.reporte_materiales),
@@ -1060,7 +1266,7 @@ def guardar_reporte(grupo_via, fecha_reporte, observaciones, fotos_subidas):
         f"{len(resumen['equipos'])} equipo(s), {len(resumen['materiales'])} material(es), "
         f"{len(resumen['asistencia'])} trabajador(es) en asistencia, {resumen['total_hh']:.0f} HH totales."
     )
-    resumen["aviso_id"] = crear_aviso_desde_reporte(reporte_id, grupo_via, resumen_texto)
+    resumen["aviso_id"] = crear_aviso_desde_reporte(reporte_id, grupo_via, ubicacion, resumen_texto)
 
     excel_bytes, pdf_bytes = generar_documentos_reporte(resumen)
 
@@ -1080,6 +1286,9 @@ def page_generar_reporte():
     horas_dia = horas_jornada_por_fecha(fecha_reporte)
     st.caption(f"📅 {DIAS_ES[fecha_reporte.weekday()]} → jornada estándar: **{horas_dia} h por trabajador** "
                f"(se usará para calcular las Horas Hombre de cada actividad).")
+
+    st.markdown("**Ubicación**")
+    ubicacion = render_captura_ubicacion()
 
     st.divider()
     st.markdown("#### 🛠️ Trabajos")
@@ -1117,7 +1326,7 @@ def page_generar_reporte():
 
     st.divider()
     if st.button("💾 Guardar Reporte", key="btn_guardar_reporte"):
-        resultado = guardar_reporte(grupo_via, fecha_reporte, observaciones, fotos_subidas)
+        resultado = guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_subidas)
         if resultado["ok"]:
             st.session_state.last_reporte = resultado["resumen"]
             st.session_state.last_reporte_excel = resultado["excel_bytes"]
@@ -1228,13 +1437,13 @@ def page_reporte_guardado():
             "⬇️ Descargar Excel", data=st.session_state.last_reporte_excel,
             file_name=f"Reporte_{resumen['reporte_id']}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="btn_descargar_excel", use_container_width=True,
+            key="btn_descargar_excel", width="stretch",
         )
     with dl2:
         st.download_button(
             "⬇️ Descargar PDF", data=st.session_state.last_reporte_pdf,
             file_name=f"Reporte_{resumen['reporte_id']}.pdf", mime="application/pdf",
-            key="btn_descargar_pdf", use_container_width=True,
+            key="btn_descargar_pdf", width="stretch",
         )
 
     st.divider()
@@ -1345,15 +1554,15 @@ def validador_inicio():
     if st.button("📊  Reportes (Demo)", key="btn_reportes"):
         st.info("Próximamente: dashboard de KPIs.")
 
-    if os.path.exists(REPORTES_XLSX_PATH):
-        with open(REPORTES_XLSX_PATH, "rb") as f:
-            st.download_button(
-                "💾  Descargar respaldo de Reportes Diarios",
-                data=f.read(),
-                file_name="reportes_diarios_respaldo.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="btn_backup_reportes", use_container_width=True,
-            )
+    respaldo_bytes = generar_respaldo_plano()
+    if respaldo_bytes:
+        st.download_button(
+            "💾  Descargar respaldo de Reportes Diarios",
+            data=respaldo_bytes,
+            file_name="reportes_diarios_respaldo.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="btn_backup_reportes", width="stretch",
+        )
 
     st.markdown("<div style='text-align:center;opacity:.5;padding-top:10px;'>sacyr</div>", unsafe_allow_html=True)
 
@@ -1396,117 +1605,130 @@ def validador_detalle():
     df = st.session_state.avisos
     row = df[df["AvisoID"] == aviso_id].iloc[0].to_dict()
 
-    estado_kind = {"Nuevo": "bad", "En validación": "info", "Observado": "warn",
-                   "Validado": "ok", "OT creada": "ok", "Cerrado": "muted", "Rechazado": "bad"}
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        badge(row["Estado"], estado_kind.get(row["Estado"], "info"))
-    with c2:
-        st.markdown(f"<div style='text-align:right;color:#888;font-size:13px;'>ID: {row['AvisoID']}</div>", unsafe_allow_html=True)
-
-    st.write("")
-    st.markdown(
-        f"""
-        **Detectado:** {row['CreadoPor']} ({row['RolCreador']})
-        **Activo:** {row['Activo']}
-        **Ubicación:** {row['Ubicacion']}
-        **Prioridad:** {row['Prioridad']}
-        **Tipificación:** {row['Tipificacion']}
-        """
-    )
-    if row["Adjunto"]:
-        st.caption(f"📎 Adjunto: {row['Adjunto']}")
-    if row.get("ReporteID"):
-        st.caption(f"🔗 Vinculado al Reporte Diario {row['ReporteID']}")
-    st.caption(f"📄 {row['AvisoID']} · {row['FechaHora']} &nbsp; 🕐 {elapsed_str(row['FechaHora'])}")
-
-    st.divider()
-
-    rol_final = row.get("RolFinal") or "EFE"
-    col_aprob, col_obs_name, col_fecha, col_resp = final_cols(rol_final)
-
-    st.markdown(f"## Validación (Sacyr / ADI / {rol_final})")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        badge("Sacyr", "ok" if row["AprobadoSacyr"] else "muted")
-        st.caption(row["FechaValSacyr"] or "—")
-    with c2:
-        badge("ADI (ITO)", "ok" if row["AprobadoADI"] else "muted")
-        st.caption(row["FechaValADI"] or "—")
-    with c3:
-        badge(rol_final, "ok" if row[col_aprob] else "muted")
-        st.caption(row[col_fecha] or "—")
-
-    st.write("")
-    role = st.session_state.perfil
-    can_do = can_validate(role, row)
-    obs = st.text_area("Observación / comentario", height=80, key=f"obs_{aviso_id}_{role}")
-
-    obs_col_map = {"Sacyr": "ObsSacyr", "ADI (ITO)": "ObsADI", rol_final: col_obs_name}
-
-    colA, colB, colC = st.columns(3)
-    with colA:
-        if st.button("✅ Aprobar", disabled=not can_do, key="btn_aprobar"):
-            if role == "Sacyr":
-                st.session_state.avisos.loc[df["AvisoID"] == aviso_id, ["AprobadoSacyr", "ObsSacyr", "FechaValSacyr", "RespValSacyr"]] = [True, obs, now_str(), st.session_state.usuario]
-            elif role == "ADI (ITO)":
-                st.session_state.avisos.loc[df["AvisoID"] == aviso_id, ["AprobadoADI", "ObsADI", "FechaValADI", "RespValADI"]] = [True, obs, now_str(), st.session_state.usuario]
-            elif role == rol_final:
-                st.session_state.avisos.loc[df["AvisoID"] == aviso_id, [col_aprob, col_obs_name, col_fecha, col_resp]] = [True, obs, now_str(), st.session_state.usuario]
-            move_to_next_level(aviso_id, role)
-            save_all_avisos()
-            st.success("Aprobación registrada ✅")
-            st.rerun()
-    with colB:
-        if st.button("🟨 Observar", disabled=not can_do, key="btn_observar"):
-            st.session_state.avisos.loc[df["AvisoID"] == aviso_id, "Estado"] = "Observado"
-            st.session_state.avisos.loc[df["AvisoID"] == aviso_id, "ValidacionNivel"] = "Sacyr"
-            st.session_state.avisos.loc[df["AvisoID"] == aviso_id, obs_col_map[role]] = obs
-            save_all_avisos()
-            st.warning("Aviso observado. Vuelve a Sacyr para completar información.")
-            st.rerun()
-    with colC:
-        if st.button("⛔ Rechazar", disabled=not can_do, key="btn_rechazar"):
-            st.session_state.avisos.loc[df["AvisoID"] == aviso_id, "Estado"] = "Rechazado"
-            st.session_state.avisos.loc[df["AvisoID"] == aviso_id, obs_col_map[role]] = obs
-            save_all_avisos()
-            st.error("Aviso rechazado.")
-            st.rerun()
-
-    st.divider()
-    st.markdown("## Crear OT")
-    df = st.session_state.avisos
-    row = df[df["AvisoID"] == aviso_id].iloc[0].to_dict()
-
-    if row["OT_Creada"]:
-        st.info("Este aviso ya tiene una OT asociada. Ve a Backlog de OTs.")
-    elif row["Estado"] != "Validado":
-        st.info(f"⚠️ Para crear OT, el Aviso debe estar **Validado** (Sacyr → ADI → {rol_final}).")
+    tiene_reporte = bool(row.get("ReporteID"))
+    if tiene_reporte:
+        tab_detalle, tab_reporte = st.tabs(["📋 Detalle del Aviso", "👁️ Ver Reporte Diario"])
     else:
-        with st.form("form_ot"):
-            responsable = st.selectbox("Responsable", ["Camila Pérez", "Jefe Mantenimiento", "Planner", "Técnico 1"])
-            fecha_prog_d = st.date_input("Fecha Programada (día)", datetime.now().date())
-            fecha_prog_t = st.time_input("Hora Programada", datetime.now().time().replace(second=0, microsecond=0))
-            submitted_ot = st.form_submit_button("Iniciar OT", key="btn_iniciar_ot")
-        if submitted_ot:
-            fecha_prog = datetime.combine(fecha_prog_d, fecha_prog_t)
-            ot_id = next_ot_id()
-            new_ot = {"OTID": ot_id, "AvisoID": row["AvisoID"], "Activo": row["Activo"],
-                      "Responsable": responsable, "FechaProgramada": fecha_prog.strftime("%Y-%m-%d %H:%M"), "EstadoOT": "Programada"}
-            st.session_state.ots = pd.concat([st.session_state.ots, pd.DataFrame([new_ot])], ignore_index=True)
-            st.session_state.avisos.loc[df["AvisoID"] == row["AvisoID"], "OT_Creada"] = True
-            st.session_state.avisos.loc[df["AvisoID"] == row["AvisoID"], "Estado"] = "OT creada"
-            save_all_avisos()
-            save_all_ots()
-            st.success(f"OT {ot_id} creada ✅")
-            st.session_state.page = "OTs"
-            st.rerun()
+        tab_detalle = st.container()
+        tab_reporte = None
 
-    st.write("")
-    if st.button("✅ Cerrar Aviso", key="btn_cerrar"):
-        st.session_state.avisos.loc[st.session_state.avisos["AvisoID"] == aviso_id, "Estado"] = "Cerrado"
-        save_all_avisos()
-        st.success("Aviso cerrado.")
+    with tab_detalle:
+        estado_kind = {"Nuevo": "bad", "En validación": "info", "Observado": "warn",
+                       "Validado": "ok", "OT creada": "ok", "Cerrado": "muted", "Rechazado": "bad"}
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            badge(row["Estado"], estado_kind.get(row["Estado"], "info"))
+        with c2:
+            st.markdown(f"<div style='text-align:right;color:#888;font-size:13px;'>ID: {row['AvisoID']}</div>", unsafe_allow_html=True)
+
+        st.write("")
+        st.markdown(
+            f"""
+            **Detectado:** {row['CreadoPor']} ({row['RolCreador']})
+            **Activo:** {row['Activo']}
+            **Ubicación:** {row['Ubicacion']}
+            **Prioridad:** {row['Prioridad']}
+            **Tipificación:** {row['Tipificacion']}
+            """
+        )
+        if row["Adjunto"]:
+            st.caption(f"📎 Adjunto: {row['Adjunto']}")
+        if tiene_reporte:
+            st.caption(f"🔗 Vinculado al Reporte Diario {row['ReporteID']} · ver pestaña 'Ver Reporte Diario'")
+        st.caption(f"📄 {row['AvisoID']} · {row['FechaHora']} &nbsp; 🕐 {elapsed_str(row['FechaHora'])}")
+
+        st.divider()
+
+        rol_final = row.get("RolFinal") or "EFE"
+        col_aprob, col_obs_name, col_fecha, col_resp = final_cols(rol_final)
+
+        st.markdown(f"## Validación (Sacyr / ADI / {rol_final})")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            badge("Sacyr", "ok" if row["AprobadoSacyr"] else "muted")
+            st.caption(row["FechaValSacyr"] or "—")
+        with c2:
+            badge("ADI (ITO)", "ok" if row["AprobadoADI"] else "muted")
+            st.caption(row["FechaValADI"] or "—")
+        with c3:
+            badge(rol_final, "ok" if row[col_aprob] else "muted")
+            st.caption(row[col_fecha] or "—")
+
+        st.write("")
+        role = st.session_state.perfil
+        can_do = can_validate(role, row)
+        obs = st.text_area("Observación / comentario", height=80, key=f"obs_{aviso_id}_{role}")
+
+        obs_col_map = {"Sacyr": "ObsSacyr", "ADI (ITO)": "ObsADI", rol_final: col_obs_name}
+
+        colA, colB, colC = st.columns(3)
+        with colA:
+            if st.button("✅ Aprobar", disabled=not can_do, key="btn_aprobar"):
+                if role == "Sacyr":
+                    st.session_state.avisos.loc[df["AvisoID"] == aviso_id, ["AprobadoSacyr", "ObsSacyr", "FechaValSacyr", "RespValSacyr"]] = [True, obs, now_str(), st.session_state.usuario]
+                elif role == "ADI (ITO)":
+                    st.session_state.avisos.loc[df["AvisoID"] == aviso_id, ["AprobadoADI", "ObsADI", "FechaValADI", "RespValADI"]] = [True, obs, now_str(), st.session_state.usuario]
+                elif role == rol_final:
+                    st.session_state.avisos.loc[df["AvisoID"] == aviso_id, [col_aprob, col_obs_name, col_fecha, col_resp]] = [True, obs, now_str(), st.session_state.usuario]
+                move_to_next_level(aviso_id, role)
+                save_all_avisos()
+                st.success("Aprobación registrada ✅")
+                st.rerun()
+        with colB:
+            if st.button("🟨 Observar", disabled=not can_do, key="btn_observar"):
+                st.session_state.avisos.loc[df["AvisoID"] == aviso_id, "Estado"] = "Observado"
+                st.session_state.avisos.loc[df["AvisoID"] == aviso_id, "ValidacionNivel"] = "Sacyr"
+                st.session_state.avisos.loc[df["AvisoID"] == aviso_id, obs_col_map[role]] = obs
+                save_all_avisos()
+                st.warning("Aviso observado. Vuelve a Sacyr para completar información.")
+                st.rerun()
+        with colC:
+            if st.button("⛔ Rechazar", disabled=not can_do, key="btn_rechazar"):
+                st.session_state.avisos.loc[df["AvisoID"] == aviso_id, "Estado"] = "Rechazado"
+                st.session_state.avisos.loc[df["AvisoID"] == aviso_id, obs_col_map[role]] = obs
+                save_all_avisos()
+                st.error("Aviso rechazado.")
+                st.rerun()
+
+        st.divider()
+        st.markdown("## Crear OT")
+        df = st.session_state.avisos
+        row = df[df["AvisoID"] == aviso_id].iloc[0].to_dict()
+
+        if row["OT_Creada"]:
+            st.info("Este aviso ya tiene una OT asociada. Ve a Backlog de OTs.")
+        elif row["Estado"] != "Validado":
+            st.info(f"⚠️ Para crear OT, el Aviso debe estar **Validado** (Sacyr → ADI → {rol_final}).")
+        else:
+            with st.form("form_ot"):
+                responsable = st.selectbox("Responsable", ["Camila Pérez", "Jefe Mantenimiento", "Planner", "Técnico 1"])
+                fecha_prog_d = st.date_input("Fecha Programada (día)", datetime.now().date())
+                fecha_prog_t = st.time_input("Hora Programada", datetime.now().time().replace(second=0, microsecond=0))
+                submitted_ot = st.form_submit_button("Iniciar OT", key="btn_iniciar_ot")
+            if submitted_ot:
+                fecha_prog = datetime.combine(fecha_prog_d, fecha_prog_t)
+                ot_id = next_ot_id()
+                new_ot = {"OTID": ot_id, "AvisoID": row["AvisoID"], "Activo": row["Activo"],
+                          "Responsable": responsable, "FechaProgramada": fecha_prog.strftime("%Y-%m-%d %H:%M"), "EstadoOT": "Programada"}
+                st.session_state.ots = pd.concat([st.session_state.ots, pd.DataFrame([new_ot])], ignore_index=True)
+                st.session_state.avisos.loc[df["AvisoID"] == row["AvisoID"], "OT_Creada"] = True
+                st.session_state.avisos.loc[df["AvisoID"] == row["AvisoID"], "Estado"] = "OT creada"
+                save_all_avisos()
+                save_all_ots()
+                st.success(f"OT {ot_id} creada ✅")
+                st.session_state.page = "OTs"
+                st.rerun()
+
+        st.write("")
+        if st.button("✅ Cerrar Aviso", key="btn_cerrar"):
+            st.session_state.avisos.loc[st.session_state.avisos["AvisoID"] == aviso_id, "Estado"] = "Cerrado"
+            save_all_avisos()
+            st.success("Aviso cerrado.")
+
+    if tab_reporte is not None:
+        with tab_reporte:
+            st.caption("Solo lectura — esto es exactamente lo que ingresó Personal de Terreno.")
+            mostrar_detalle_reporte_diario(row["ReporteID"])
 
 def validador_ots():
     app_header("Backlog de OTs", back_page="Inicio", right_icon="📊")
