@@ -13,6 +13,7 @@ from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage, ImageOps
 import gspread
 from google.oauth2.service_account import Credentials as GoogleCredentials
+from streamlit_geolocation import streamlit_geolocation
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib import colors
@@ -1060,11 +1061,6 @@ def render_captura_ubicacion() -> str:
     )
 
     if modo == "📍 Usar GPS del celular":
-        qp = st.query_params
-        if "lat" in qp and "lon" in qp:
-            st.session_state.rep_ubicacion_gps = f"{qp['lat']}, {qp['lon']} (GPS)"
-            st.query_params.clear()
-
         if st.session_state.rep_ubicacion_gps:
             st.success(f"📍 {st.session_state.rep_ubicacion_gps}")
             if st.button("🔄 Volver a capturar", key="btn_gps_recapturar"):
@@ -1072,59 +1068,13 @@ def render_captura_ubicacion() -> str:
                 st.rerun()
             return st.session_state.rep_ubicacion_gps
 
-        html_gps = """
-        <div style="font-family: -apple-system, sans-serif;">
-          <button id="btnGPS" style="
-              width:100%; padding:0.65rem 1rem; border-radius:10px; font-weight:600;
-              background:#0B3B8A; color:#fff; border:none; font-size:15px; cursor:pointer;">
-            📍 Obtener mi ubicación actual
-          </button>
-          <p id="gpsStatus" style="font-size:12.5px; color:#888; margin-top:6px; min-height:16px;"></p>
-        </div>
-        <script>
-        (function () {
-          const btn = document.getElementById('btnGPS');
-          const statusEl = document.getElementById('gpsStatus');
-          btn.addEventListener('click', function () {
-            // Streamlit muestra esto dentro de un iframe. La API de geolocalización del
-            // propio iframe suele quedar bloqueada por la política de permisos del navegador
-            // (a veces sin ni mostrar el diálogo de "permitir ubicación"). El truco: pedirla
-            // usando el navigator de la ventana de arriba (la pestaña real), que sí tiene
-            // permisos completos, en vez del navigator del iframe.
-            let topWindow, geo;
-            try {
-              topWindow = window.parent;
-              geo = topWindow.navigator.geolocation;
-            } catch (err) {
-              statusEl.textContent = 'No se pudo acceder a la ubicación desde este navegador. Usa la opción de texto.';
-              return;
-            }
-            if (!geo) {
-              statusEl.textContent = 'Este navegador no soporta geolocalización. Usa la opción de texto.';
-              return;
-            }
-            statusEl.textContent = 'Obteniendo ubicación... acepta el permiso si tu navegador lo pide.';
-            geo.getCurrentPosition(function (pos) {
-              const lat = pos.coords.latitude.toFixed(6);
-              const lon = pos.coords.longitude.toFixed(6);
-              const url = new URL(topWindow.location.href);
-              url.searchParams.set('lat', lat);
-              url.searchParams.set('lon', lon);
-              topWindow.location.href = url.toString();
-            }, function (err) {
-              let msg = 'No se pudo obtener la ubicación (' + err.message + ').';
-              if (err.code === 1) {
-                msg = 'Permiso de ubicación denegado. Revisa los permisos de este sitio en tu navegador (candado junto a la URL) y vuelve a intentar.';
-              } else if (err.code === 3) {
-                msg = 'Se agotó el tiempo esperando el GPS. Intenta de nuevo, de preferencia al aire libre.';
-              }
-              statusEl.textContent = msg + ' O usa la opción de texto.';
-            }, { enableHighAccuracy: true, timeout: 10000 });
-          });
-        })();
-        </script>
-        """
-        st.iframe(html_gps, height=90)
+        st.caption("Toca el botón 📍 y acepta el permiso de ubicación si tu navegador lo pide.")
+        loc = streamlit_geolocation()
+        lat = loc.get("latitude") if loc else None
+        lon = loc.get("longitude") if loc else None
+        if lat is not None and lon is not None:
+            st.session_state.rep_ubicacion_gps = f"{lat:.6f}, {lon:.6f} (GPS)"
+            st.rerun()
         return ""
     else:
         return st.text_input(
