@@ -11,6 +11,8 @@ import openpyxl
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage, ImageOps
+import gspread
+from google.oauth2.service_account import Credentials as GoogleCredentials
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib import colors
@@ -263,6 +265,93 @@ CARGOS_TRABAJADOR = ["Jefe de Grupo", "Ayudante", "Chofer", "P5.1", "Operario V�
 
 GRUPOS_VIA = ["01", "02", "03", "04", "05"]
 
+# -------------------------
+# Google Sheets: histórico durable (sobrevive reinicios del hosting).
+# El Excel local se mantiene igual, para las descargas del momento; Sheets es
+# la fuente de verdad cuando está configurada en Secrets ([google_sheets] ...).
+# -------------------------
+GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+@st.cache_resource(show_spinner=False)
+def _cliente_sheets():
+    """Conecta con el Google Sheet configurado en Secrets. Si no está configurado
+    o falla la conexión, devuelve None y la app sigue funcionando solo con el Excel local."""
+    try:
+        creds_info = dict(st.secrets["google_sheets"]["credentials"])
+        sheet_id = st.secrets["google_sheets"]["sheet_id"]
+    except Exception:
+        return None
+    try:
+        creds = GoogleCredentials.from_service_account_info(creds_info, scopes=GOOGLE_SHEETS_SCOPES)
+        gc = gspread.authorize(creds)
+        return gc.open_by_key(sheet_id)
+    except Exception:
+        return None
+
+def _hoja_sheets(spreadsheet, nombre_hoja: str):
+    headers = REPORTES_SHEETS[nombre_hoja]
+    try:
+        ws = spreadsheet.worksheet(nombre_hoja)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=nombre_hoja, rows=2000, cols=max(len(headers), 10))
+        ws.append_row(headers)
+        return ws
+    if not ws.row_values(1):
+        ws.append_row(headers)
+    return ws
+
+def _leer_hoja_df(nombre_hoja: str) -> pd.DataFrame:
+    """Lee una hoja completa como DataFrame: desde Google Sheets si está configurado
+    (fuente de verdad, sobrevive reinicios), si no desde el Excel local."""
+    columnas = REPORTES_SHEETS.get(nombre_hoja, [])
+    sh = _cliente_sheets()
+    if sh is not None:
+        try:
+            ws = _hoja_sheets(sh, nombre_hoja)
+            registros = ws.get_all_records()
+            # Sin filas de datos, get_all_records() devuelve [] y pd.DataFrame([]) queda sin
+            # columnas -- forzamos las columnas esperadas para que df["ReporteID"] no reviente.
+            return pd.DataFrame(registros) if registros else pd.DataFrame(columns=columnas)
+        except Exception:
+            pass
+    if not os.path.exists(REPORTES_XLSX_PATH):
+        return pd.DataFrame(columns=columnas)
+    try:
+        return pd.read_excel(REPORTES_XLSX_PATH, sheet_name=nombre_hoja)
+    except Exception:
+        return pd.DataFrame(columns=columnas)
+
+def _agregar_filas(nombre_hoja: str, filas: list):
+    """Agrega filas a una hoja: siempre al Excel local (para las descargas del momento),
+    y también a Google Sheets si está configurado (para que el histórico no se pierda
+    aunque la nube reinicie el almacenamiento local)."""
+    if not filas:
+        return
+    init_reportes_excel()
+    wb = openpyxl.load_workbook(REPORTES_XLSX_PATH)
+    ws_local = wb[nombre_hoja]
+    for fila in filas:
+        ws_local.append(fila)
+    wb.save(REPORTES_XLSX_PATH)
+
+    sh = _cliente_sheets()
+    if sh is not None:
+        try:
+            ws = _hoja_sheets(sh, nombre_hoja)
+            filas_texto = [[("" if v is None else v) for v in fila] for fila in filas]
+            ws.append_rows(filas_texto, value_input_option="USER_ENTERED")
+        except Exception:
+            pass  # si falla Sheets, el reporte igual quedó guardado en el Excel local
+
+def _num(val, default=0.0):
+    """Convierte a número de forma segura; Sheets a veces entrega '' en celdas vacías."""
+    try:
+        if val is None or val == "":
+            return default
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
 def migrate_reportes_excel():
     """Agrega hojas/columnas nuevas a un libro ya existente sin tocar los datos previos."""
     wb = openpyxl.load_workbook(REPORTES_XLSX_PATH)
@@ -300,45 +389,30 @@ def init_reportes_excel():
     wb.save(REPORTES_XLSX_PATH)
 
 def next_reporte_id():
-    init_reportes_excel()
-    wb = openpyxl.load_workbook(REPORTES_XLSX_PATH, read_only=True)
-    ws = wb["Reportes"]
+    df = _leer_hoja_df("Reportes")
     nums = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row or row[0] is None:
-            continue
-        try:
-            nums.append(int(str(row[0]).split("-")[1]))
-        except Exception:
-            pass
-    wb.close()
+    if not df.empty and "ReporteID" in df.columns:
+        for val in df["ReporteID"].astype(str):
+            try:
+                nums.append(int(val.split("-")[1]))
+            except Exception:
+                pass
     n = (max(nums) + 1) if nums else 1
     return f"RPT-{n:05d}"
 
 def guardar_reporte_excel(reporte_row, trabajos_rows, equipos_rows, materiales_rows, asistencia_rows, fotos_rows):
-    init_reportes_excel()
-    wb = openpyxl.load_workbook(REPORTES_XLSX_PATH)
-    wb["Reportes"].append(reporte_row)
-    for r in trabajos_rows:
-        wb["Trabajos"].append(r)
-    for r in equipos_rows:
-        wb["Equipos"].append(r)
-    for r in materiales_rows:
-        wb["Materiales"].append(r)
-    for r in asistencia_rows:
-        wb["Asistencia"].append(r)
-    for r in fotos_rows:
-        wb["Fotos"].append(r)
-    wb.save(REPORTES_XLSX_PATH)
+    _agregar_filas("Reportes", [reporte_row])
+    _agregar_filas("Trabajos", trabajos_rows)
+    _agregar_filas("Equipos", equipos_rows)
+    _agregar_filas("Materiales", materiales_rows)
+    _agregar_filas("Asistencia", asistencia_rows)
+    _agregar_filas("Fotos", fotos_rows)
 
 def obtener_actividades_hoy(usuario: str) -> list:
     """Actividades registradas en el/los Reporte(s) Diario(s) de hoy para este usuario."""
-    if not os.path.exists(REPORTES_XLSX_PATH):
-        return []
-    try:
-        df_rep = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Reportes")
-        df_trab = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Trabajos")
-    except Exception:
+    df_rep = _leer_hoja_df("Reportes")
+    df_trab = _leer_hoja_df("Trabajos")
+    if df_rep.empty or df_trab.empty:
         return []
     hoy = datetime.now().strftime("%Y-%m-%d")
     reportes_hoy = df_rep[(df_rep["Fecha"].astype(str) == hoy) & (df_rep["Usuario"] == usuario)]["ReporteID"].tolist()
@@ -517,17 +591,12 @@ def generar_respaldo_plano() -> bytes | None:
     guardados hasta ahora): una fila por actividad, con Equipo/Materiales/Fotos-Observación/
     Asistencia condensados cada uno en una sola celda. El libro maestro (reportes_diarios.xlsx)
     sigue normalizado en hojas separadas para Power BI; esto es solo una vista aparte para leer rápido."""
-    if not os.path.exists(REPORTES_XLSX_PATH):
-        return None
-    try:
-        df_rep = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Reportes")
-        df_trab = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Trabajos")
-        df_equ = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Equipos")
-        df_mat = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Materiales")
-        df_asi = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Asistencia")
-        df_fot = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Fotos")
-    except Exception:
-        return None
+    df_rep = _leer_hoja_df("Reportes")
+    df_trab = _leer_hoja_df("Trabajos")
+    df_equ = _leer_hoja_df("Equipos")
+    df_mat = _leer_hoja_df("Materiales")
+    df_asi = _leer_hoja_df("Asistencia")
+    df_fot = _leer_hoja_df("Fotos")
     if df_rep.empty:
         return None
 
@@ -543,10 +612,10 @@ def generar_respaldo_plano() -> bytes | None:
             continue
 
         equipo_txt = ", ".join(
-            f"{r['Equipo']} ({r['Cantidad']:.0f})" for _, r in df_equ[df_equ["ReporteID"] == rid].iterrows()
+            f"{r['Equipo']} ({_num(r['Cantidad']):.0f})" for _, r in df_equ[df_equ["ReporteID"] == rid].iterrows()
         ) or "—"
         material_txt = ", ".join(
-            f"{r['Material']} ({r['Cantidad']:.0f}, {r.get('Estado') or '—'})"
+            f"{r['Material']} ({_num(r['Cantidad']):.0f}, {r.get('Estado') or '—'})"
             for _, r in df_mat[df_mat["ReporteID"] == rid].iterrows()
         ) or "—"
         fotos_lista = df_fot[df_fot["ReporteID"] == rid]["NombreArchivo"].tolist()
@@ -580,18 +649,14 @@ def generar_respaldo_plano() -> bytes | None:
 def mostrar_detalle_reporte_diario(reporte_id: str):
     """Vista de solo lectura de un Reporte Diario, para que el validador vea exactamente
     lo que ingresó Personal de Terreno (sin poder editarlo desde acá)."""
-    if not os.path.exists(REPORTES_XLSX_PATH):
+    df_rep = _leer_hoja_df("Reportes")
+    df_trab = _leer_hoja_df("Trabajos")
+    df_equ = _leer_hoja_df("Equipos")
+    df_mat = _leer_hoja_df("Materiales")
+    df_asi = _leer_hoja_df("Asistencia")
+    df_fot = _leer_hoja_df("Fotos")
+    if df_rep.empty:
         st.info("No se encontró el archivo de Reportes Diarios.")
-        return
-    try:
-        df_rep = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Reportes")
-        df_trab = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Trabajos")
-        df_equ = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Equipos")
-        df_mat = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Materiales")
-        df_asi = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Asistencia")
-        df_fot = pd.read_excel(REPORTES_XLSX_PATH, sheet_name="Fotos")
-    except Exception:
-        st.info("No se pudo leer el Reporte Diario.")
         return
 
     fila_rep = df_rep[df_rep["ReporteID"] == reporte_id]
