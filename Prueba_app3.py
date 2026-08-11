@@ -1086,20 +1086,39 @@ def render_captura_ubicacion() -> str:
           const btn = document.getElementById('btnGPS');
           const statusEl = document.getElementById('gpsStatus');
           btn.addEventListener('click', function () {
-            if (!navigator.geolocation) {
+            // Streamlit muestra esto dentro de un iframe. La API de geolocalización del
+            // propio iframe suele quedar bloqueada por la política de permisos del navegador
+            // (a veces sin ni mostrar el diálogo de "permitir ubicación"). El truco: pedirla
+            // usando el navigator de la ventana de arriba (la pestaña real), que sí tiene
+            // permisos completos, en vez del navigator del iframe.
+            let topWindow, geo;
+            try {
+              topWindow = window.parent;
+              geo = topWindow.navigator.geolocation;
+            } catch (err) {
+              statusEl.textContent = 'No se pudo acceder a la ubicación desde este navegador. Usa la opción de texto.';
+              return;
+            }
+            if (!geo) {
               statusEl.textContent = 'Este navegador no soporta geolocalización. Usa la opción de texto.';
               return;
             }
             statusEl.textContent = 'Obteniendo ubicación... acepta el permiso si tu navegador lo pide.';
-            navigator.geolocation.getCurrentPosition(function (pos) {
+            geo.getCurrentPosition(function (pos) {
               const lat = pos.coords.latitude.toFixed(6);
               const lon = pos.coords.longitude.toFixed(6);
-              const url = new URL(window.parent.location.href);
+              const url = new URL(topWindow.location.href);
               url.searchParams.set('lat', lat);
               url.searchParams.set('lon', lon);
-              window.parent.location.href = url.toString();
+              topWindow.location.href = url.toString();
             }, function (err) {
-              statusEl.textContent = 'No se pudo obtener la ubicación: ' + err.message + '. Usa la opción de texto.';
+              let msg = 'No se pudo obtener la ubicación (' + err.message + ').';
+              if (err.code === 1) {
+                msg = 'Permiso de ubicación denegado. Revisa los permisos de este sitio en tu navegador (candado junto a la URL) y vuelve a intentar.';
+              } else if (err.code === 3) {
+                msg = 'Se agotó el tiempo esperando el GPS. Intenta de nuevo, de preferencia al aire libre.';
+              }
+              statusEl.textContent = msg + ' O usa la opción de texto.';
             }, { enableHighAccuracy: true, timeout: 10000 });
           });
         })();
