@@ -83,12 +83,8 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
 .aviso-desc { color: #444; font-size: 13.5px; }
 .aviso-meta { color: #888; font-size: 12px; margin-top: 4px; }
 
-/* ---- Login profile buttons ---- */
-.st-key-login_Personal_Terreno button { border-left: 5px solid #2FA84F !important; text-align: left !important; }
-.st-key-login_Sacyr button { border-left: 5px solid #0B3B8A !important; text-align: left !important; }
-.st-key-login_ADI_ITO button { border-left: 5px solid #7B4FBE !important; text-align: left !important; }
-.st-key-login_EFE button { border-left: 5px solid #E0A458 !important; text-align: left !important; }
-.st-key-login_Supervisor_Subcontrato button { border-left: 5px solid #16A34A !important; text-align: left !important; }
+/* ---- Login ---- */
+.st-key-btn_login button { background: #0B3B8A !important; color: #fff !important; border: none !important; }
 
 /* ---- Fixed bottom nav ---- */
 .st-key-bottom_nav {
@@ -660,13 +656,6 @@ def mostrar_detalle_reporte_diario(reporte_id: str):
 # -------------------------
 ROLES_VALIDADORES = ["Sacyr", "ADI (ITO)", "EFE", "Supervisor Subcontrato"]  # también son niveles de validación, en orden
 PERFILES = ["Personal Terreno"] + ROLES_VALIDADORES
-PERFIL_INFO = {
-    "Personal Terreno": ("🦺", "Reporta hallazgos y averías en terreno"),
-    "Sacyr": ("🏗️", "Valida avisos y gestiona OT"),
-    "ADI (ITO)": ("🕵️", "Fiscaliza y valida avisos"),
-    "EFE": ("🚆", "Cliente final, valida avisos"),
-    "Supervisor Subcontrato": ("🧑‍💼", "Valida los Reportes Diarios de Icafal"),
-}
 
 init_db()
 
@@ -675,6 +664,8 @@ def init_data():
         st.session_state.perfil = None
     if "usuario" not in st.session_state:
         st.session_state.usuario = ""
+    if "login_form_counter" not in st.session_state:
+        st.session_state.login_form_counter = 0
     if "page" not in st.session_state:
         st.session_state.page = "Inicio"
     if "activos" not in st.session_state:
@@ -867,20 +858,47 @@ def move_to_next_level(aviso_id: str, current_level: str):
 # -------------------------
 # LOGIN
 # -------------------------
+def cargar_usuarios() -> dict:
+    """Lee las 6 cuentas de acceso desde Secrets de Streamlit (nunca desde el código ni GitHub).
+    En Streamlit Cloud: panel de la app -> Settings -> Secrets.
+    En local: archivo .streamlit/secrets.toml (no se sube al repositorio)."""
+    try:
+        usuarios_raw = dict(st.secrets["usuarios"])
+    except Exception:
+        return {}
+    usuarios = {}
+    for datos in usuarios_raw.values():
+        clave = str(datos.get("usuario", "")).strip().lower()
+        if clave:
+            usuarios[clave] = {
+                "password": str(datos.get("password", "")),
+                "nombre": datos.get("nombre", clave),
+                "perfil": datos.get("perfil", "Personal Terreno"),
+            }
+    return usuarios
+
 def render_login():
     app_header("Bienvenido")
-    st.caption("Selecciona el perfil con el que quieres entrar a la app.")
-    nombre = st.text_input("Nombre (opcional)")
-    st.write("")
-    for perfil in PERFILES:
-        icon, desc = PERFIL_INFO[perfil]
-        if st.button(f"{icon}  {perfil}", key=f"login_{_slug(perfil)}"):
-            st.session_state.perfil = perfil
-            st.session_state.usuario = nombre.strip() or perfil
-            st.session_state.page = "Inicio"
-            st.rerun()
-        st.caption(desc)
-        st.write("")
+    st.caption("Ingresa con tu usuario y contraseña.")
+    counter = st.session_state.login_form_counter
+    usuario_input = st.text_input("Usuario", key=f"login_usuario_{counter}")
+    password_input = st.text_input("Contraseña", type="password", key=f"login_password_{counter}")
+
+    if st.button("Ingresar", key="btn_login"):
+        usuarios = cargar_usuarios()
+        if not usuarios:
+            st.error("Todavía no se configuraron los usuarios de esta app. Avisa al administrador.")
+        else:
+            cuenta = usuarios.get(usuario_input.strip().lower())
+            if cuenta and password_input == cuenta["password"] and cuenta["perfil"] in PERFILES:
+                st.session_state.perfil = cuenta["perfil"]
+                st.session_state.usuario = cuenta["nombre"]
+                st.session_state.page = "Inicio"
+                st.rerun()
+            else:
+                st.session_state.login_form_counter += 1
+                st.error("Usuario o contraseña incorrectos.")
+
     st.markdown("<div style='text-align:center;opacity:.5;padding-top:10px;'>sacyr</div>", unsafe_allow_html=True)
 
 if st.session_state.perfil is None:
