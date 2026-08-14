@@ -212,6 +212,7 @@ REPORTES_SHEETS = {
     "Materiales": ["ReporteID", "Material", "Cantidad", "Estado"],
     "Asistencia": ["ReporteID", "Trabajador", "Cargo", "Estado", "HoraIngreso", "HoraSalida", "HorasExtras"],
     "Fotos": ["ReporteID", "NombreArchivo", "RutaArchivo"],
+    "PlanMensual": ["Actividad", "Unidad", "Anio", "Mes", "CantidadPlanificada"],
 }
 
 DIAS_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
@@ -245,6 +246,11 @@ ACTIVIDADES_TRABAJO = [
 ]
 
 UNIDADES_TRABAJO = ["ml", "un", "m3", "km"]
+
+MESES_ES = [
+    "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+]
 
 EQUIPOS_CATALOGO = [
     "Cortadora de Rieles", "Generador Eléctrico", "Llave de Impacto", "Motosierra", "Taladro Industrial",
@@ -420,6 +426,55 @@ def obtener_actividades_hoy(usuario: str) -> list:
     if not reportes_hoy:
         return []
     return df_trab[df_trab["ReporteID"].isin(reportes_hoy)]["Actividad"].dropna().unique().tolist()
+
+# -------------------------
+# Planificación mensual (Plan vs Ejecutado)
+# -------------------------
+def guardar_plan_mensual(filas: list):
+    """Reescribe por completo la hoja PlanMensual con las filas dadas. Es una tabla chica
+    (actividades x meses), así que reemplazar todo al guardar es más simple y seguro que
+    editar celdas puntuales, y evita filas duplicadas para la misma Actividad/Año/Mes."""
+    headers = REPORTES_SHEETS["PlanMensual"]
+    init_reportes_excel()
+    wb = openpyxl.load_workbook(REPORTES_XLSX_PATH)
+    if "PlanMensual" in wb.sheetnames:
+        del wb["PlanMensual"]
+    ws = wb.create_sheet("PlanMensual")
+    ws.append(headers)
+    for fila in filas:
+        ws.append(fila)
+    wb.save(REPORTES_XLSX_PATH)
+
+    sh = _cliente_sheets()
+    if sh is not None:
+        try:
+            try:
+                ws2 = sh.worksheet("PlanMensual")
+                sh.del_worksheet(ws2)
+            except gspread.WorksheetNotFound:
+                pass
+            ws2 = sh.add_worksheet(title="PlanMensual", rows=max(len(filas) + 10, 50), cols=len(headers))
+            ws2.append_row(headers)
+            if filas:
+                filas_texto = [[("" if v is None else v) for v in fila] for fila in filas]
+                ws2.append_rows(filas_texto, value_input_option="USER_ENTERED")
+        except Exception:
+            pass  # si falla Sheets, el plan igual quedó guardado en el Excel local
+
+def ejecutado_por_actividad(anio: int, mes: int) -> dict:
+    """Suma la Cantidad ejecutada por Actividad en un mes/año, a partir de los Reportes
+    Diarios reales (hoja Trabajos, cruzada con Reportes para filtrar por Fecha)."""
+    df_rep = _leer_hoja_df("Reportes")
+    df_trab = _leer_hoja_df("Trabajos")
+    if df_rep.empty or df_trab.empty:
+        return {}
+    fechas = pd.to_datetime(df_rep["Fecha"], errors="coerce")
+    reportes_mes = df_rep[(fechas.dt.year == anio) & (fechas.dt.month == mes)]["ReporteID"].tolist()
+    if not reportes_mes:
+        return {}
+    trab_mes = df_trab[df_trab["ReporteID"].isin(reportes_mes)].copy()
+    trab_mes["Cantidad"] = trab_mes["Cantidad"].apply(_num)
+    return trab_mes.groupby("Actividad")["Cantidad"].sum().to_dict()
 
 def _resolver_nombre(item: dict) -> str:
     if item["nombre"] == "Otro (especificar)":
@@ -1603,6 +1658,9 @@ def validador_inicio():
     if st.button(f"🔧  Backlog de OTs\n{ots_prog} Programadas", key="btn_backlog_ots"):
         st.session_state.page = "OTs"
         st.rerun()
+    if st.button("📅  Planificación (Plan vs Ejecutado)", key="btn_planificacion"):
+        st.session_state.page = "Planificación"
+        st.rerun()
     if st.button("📊  Reportes (Demo)", key="btn_reportes"):
         st.info("Próximamente: dashboard de KPIs.")
 
@@ -1813,6 +1871,82 @@ def validador_ots():
                 st.rerun()
         st.divider()
 
+def page_planificacion():
+    app_header("Planificación", back_page="Inicio")
+    perfil_bar()
+
+    hoy = datetime.now()
+    c1, c2 = st.columns(2)
+    with c1:
+        anio = st.selectbox("Año", [2025, 2026, 2027], index=1, key="plan_anio")
+    with c2:
+        mes = st.selectbox(
+            "Mes", list(range(1, 13)), index=hoy.month - 1,
+            format_func=lambda m: MESES_ES[m - 1], key="plan_mes",
+        )
+
+    df_plan = _leer_hoja_df("PlanMensual")
+    plan_mes_df = pd.DataFrame(columns=REPORTES_SHEETS["PlanMensual"])
+    if not df_plan.empty:
+        plan_mes_df = df_plan[
+            (df_plan["Anio"].astype(str) == str(anio)) & (df_plan["Mes"].astype(str) == str(mes))
+        ]
+    plan_actual = dict(zip(plan_mes_df["Actividad"], plan_mes_df["CantidadPlanificada"].apply(_num)))
+    unidad_actual = dict(zip(plan_mes_df["Actividad"], plan_mes_df["Unidad"]))
+
+    st.markdown(f"#### Meta planificada — {MESES_ES[mes - 1]} {anio}")
+    st.caption("Edita la cantidad planificada de cada actividad para este mes y guarda. Estos valores los define Sacyr según la programación real (no vienen precargados).")
+
+    filas_editor = [
+        {
+            "Actividad": act,
+            "Unidad": unidad_actual.get(act) or UNIDADES_TRABAJO[0],
+            "Planificado": float(plan_actual.get(act, 0.0)),
+        }
+        for act in ACTIVIDADES_TRABAJO
+    ]
+    df_editado = st.data_editor(
+        pd.DataFrame(filas_editor),
+        hide_index=True, width="stretch", key=f"plan_editor_{anio}_{mes}",
+        column_config={
+            "Actividad": st.column_config.TextColumn(disabled=True),
+            "Unidad": st.column_config.SelectboxColumn(options=UNIDADES_TRABAJO),
+            "Planificado": st.column_config.NumberColumn(min_value=0.0, step=1.0),
+        },
+    )
+
+    if st.button("💾 Guardar planificación del mes", key="btn_guardar_plan", width="stretch"):
+        filas_mes = [
+            [row["Actividad"], row["Unidad"], anio, mes, row["Planificado"]]
+            for _, row in df_editado.iterrows()
+        ]
+        otras_filas = []
+        if not df_plan.empty:
+            resto = df_plan[~((df_plan["Anio"].astype(str) == str(anio)) & (df_plan["Mes"].astype(str) == str(mes)))]
+            otras_filas = resto.values.tolist()
+        guardar_plan_mensual(otras_filas + filas_mes)
+        st.success("Planificación guardada ✅")
+        st.rerun()
+
+    st.divider()
+    st.markdown("#### Plan vs Ejecutado")
+    st.caption("«Ejecutado» se calcula automáticamente sumando lo registrado en los Reportes Diarios de ese mes.")
+
+    ejecutado = ejecutado_por_actividad(anio, mes)
+    filas_comparacion = []
+    for act in ACTIVIDADES_TRABAJO:
+        plan_val = float(plan_actual.get(act, 0.0))
+        ejec_val = float(ejecutado.get(act, 0.0))
+        avance = (ejec_val / plan_val * 100) if plan_val > 0 else (100.0 if ejec_val > 0 else 0.0)
+        filas_comparacion.append({
+            "Actividad": act,
+            "Unidad": unidad_actual.get(act) or "—",
+            "Planificado": plan_val,
+            "Ejecutado": ejec_val,
+            "Avance %": round(avance, 1),
+        })
+    st.dataframe(pd.DataFrame(filas_comparacion), hide_index=True, width="stretch")
+
 def flujo_validador():
     page = st.session_state.page
     if page == "Inicio":
@@ -1825,6 +1959,8 @@ def flujo_validador():
         validador_detalle()
     elif page == "OTs":
         validador_ots()
+    elif page == "Planificación":
+        page_planificacion()
     else:
         st.session_state.page = "Inicio"
         st.rerun()
