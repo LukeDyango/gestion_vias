@@ -122,6 +122,8 @@ AVISO_COLUMNS = [
     "AprobadoSubcontrato", "ObsSubcontrato", "FechaValSubcontrato", "RespValSubcontrato",
 ]
 
+OTS_COLUMNS = ["OTID", "AvisoID", "Activo", "Responsable", "FechaProgramada", "EstadoOT"]
+
 def init_db():
     conn = get_db()
     c = conn.cursor()
@@ -163,12 +165,30 @@ def init_db():
     conn.commit()
     conn.close()
 
+def _leer_hoja_sheets_o_none(nombre_hoja: str, columnas: list):
+    """Intenta leer una hoja desde Google Sheets. Devuelve None si Sheets no está
+    configurado o falla, para que el llamador decida el respaldo (SQLite local)."""
+    sh = _cliente_sheets()
+    if sh is None:
+        return None
+    try:
+        ws = _hoja_sheets(sh, nombre_hoja)
+        registros = ws.get_all_records()
+        return pd.DataFrame(registros) if registros else pd.DataFrame(columns=columnas)
+    except Exception:
+        return None
+
 def load_avisos():
-    conn = get_db()
-    df = pd.read_sql("SELECT * FROM avisos", conn)
-    conn.close()
+    """Avisos: Google Sheets es la fuente de verdad cuando está configurado (así los avisos
+    creados en Streamlit Cloud sobreviven a que el hosting reinicie el disco local); si no
+    está configurado, o falla la conexión, se usa el SQLite local como respaldo."""
+    df = _leer_hoja_sheets_o_none("Avisos", AVISO_COLUMNS)
+    if df is None:
+        conn = get_db()
+        df = pd.read_sql("SELECT * FROM avisos", conn)
+        conn.close()
     for col in ["OT_Creada", "AprobadoSacyr", "AprobadoADI", "AprobadoEFE", "AprobadoSubcontrato"]:
-        df[col] = df[col].astype(bool)
+        df[col] = df[col].apply(_a_bool)
     df["RolFinal"] = df["RolFinal"].fillna("EFE").replace("", "EFE")
     return df
 
@@ -179,25 +199,34 @@ def load_activos():
     return df
 
 def load_ots():
-    conn = get_db()
-    df = pd.read_sql("SELECT * FROM ots", conn)
-    conn.close()
+    """OTs: mismo criterio que load_avisos() -- Sheets primero si está configurado, si no SQLite."""
+    df = _leer_hoja_sheets_o_none("OTs", OTS_COLUMNS)
+    if df is None:
+        conn = get_db()
+        df = pd.read_sql("SELECT * FROM ots", conn)
+        conn.close()
     return df
 
 def save_all_avisos():
-    conn = get_db()
     df = st.session_state.avisos.copy()
     for col in ["OT_Creada", "AprobadoSacyr", "AprobadoADI", "AprobadoEFE", "AprobadoSubcontrato"]:
         df[col] = df[col].astype(int)
+    df = df[AVISO_COLUMNS]
+    conn = get_db()
     df.to_sql("avisos", conn, if_exists="replace", index=False)
     conn.commit()
     conn.close()
+    _sincronizar_tabla_sheets("Avisos", df.values.tolist())
 
 def save_all_ots():
+    df = st.session_state.ots.copy()
+    if not df.empty:
+        df = df[OTS_COLUMNS]
     conn = get_db()
-    st.session_state.ots.to_sql("ots", conn, if_exists="replace", index=False)
+    df.to_sql("ots", conn, if_exists="replace", index=False)
     conn.commit()
     conn.close()
+    _sincronizar_tabla_sheets("OTs", df.values.tolist())
 
 # -------------------------
 # Reporte Diario (Personal Terreno) - base de datos en Excel
@@ -213,6 +242,8 @@ REPORTES_SHEETS = {
     "Asistencia": ["ReporteID", "Trabajador", "Cargo", "Estado", "HoraIngreso", "HoraSalida", "HorasExtras"],
     "Fotos": ["ReporteID", "NombreArchivo", "RutaArchivo"],
     "PlanMensual": ["Actividad", "Unidad", "Anio", "Mes", "CantidadPlanificada"],
+    "Avisos": AVISO_COLUMNS,
+    "OTs": OTS_COLUMNS,
 }
 
 DIAS_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
@@ -370,6 +401,32 @@ def _num(val, default=0.0):
     except (TypeError, ValueError):
         return default
 
+def _a_bool(val) -> bool:
+    """Convierte a booleano de forma segura, venga de SQLite (0/1) o de Sheets (texto)."""
+    return str(val).strip().lower() in ("1", "true", "verdadero", "si", "sí")
+
+def _sincronizar_tabla_sheets(nombre_hoja: str, filas: list):
+    """Reemplaza por completo una hoja en Google Sheets con las filas dadas (borra y recrea
+    la pestaña). Se usa para tablas chicas que se reescriben enteras cada vez que cambian
+    -Avisos, OTs, PlanMensual- en vez de ir agregando filas como en Reportes/Trabajos."""
+    sh = _cliente_sheets()
+    if sh is None:
+        return
+    headers = REPORTES_SHEETS[nombre_hoja]
+    try:
+        try:
+            ws = sh.worksheet(nombre_hoja)
+            sh.del_worksheet(ws)
+        except gspread.WorksheetNotFound:
+            pass
+        ws = sh.add_worksheet(title=nombre_hoja, rows=max(len(filas) + 10, 50), cols=len(headers))
+        ws.append_row(headers)
+        if filas:
+            filas_texto = [[("" if v is None else v) for v in fila] for fila in filas]
+            ws.append_rows(filas_texto, value_input_option="USER_ENTERED")
+    except Exception:
+        pass  # si falla Sheets, los datos igual quedaron guardados localmente
+
 def migrate_reportes_excel():
     """Agrega hojas/columnas nuevas a un libro ya existente sin tocar los datos previos."""
     wb = openpyxl.load_workbook(REPORTES_XLSX_PATH)
@@ -456,21 +513,7 @@ def guardar_plan_mensual(filas: list):
         ws.append(fila)
     wb.save(REPORTES_XLSX_PATH)
 
-    sh = _cliente_sheets()
-    if sh is not None:
-        try:
-            try:
-                ws2 = sh.worksheet("PlanMensual")
-                sh.del_worksheet(ws2)
-            except gspread.WorksheetNotFound:
-                pass
-            ws2 = sh.add_worksheet(title="PlanMensual", rows=max(len(filas) + 10, 50), cols=len(headers))
-            ws2.append_row(headers)
-            if filas:
-                filas_texto = [[("" if v is None else v) for v in fila] for fila in filas]
-                ws2.append_rows(filas_texto, value_input_option="USER_ENTERED")
-        except Exception:
-            pass  # si falla Sheets, el plan igual quedó guardado en el Excel local
+    _sincronizar_tabla_sheets("PlanMensual", filas)
 
 def ejecutado_por_actividad(anio: int, mes: int) -> dict:
     """Suma la Cantidad ejecutada por Actividad en un mes/año, a partir de los Reportes
