@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 import pandas as pd
 import sqlite3
 import os
@@ -1335,7 +1335,7 @@ def render_asistencia_section():
                 st.session_state.reporte_asistencia.pop(idx)
                 st.rerun()
 
-def crear_aviso_desde_reporte(reporte_id: str, grupo_via: str, ubicacion: str, resumen_texto: str) -> str:
+def crear_aviso_desde_reporte(reporte_id: str, grupo_via: str, ubicacion: str, resumen_texto: str, creado_por: str | None = None) -> str:
     """Al guardar un Reporte Diario, se levanta automáticamente un aviso para que lo validen
     Sacyr, la ITO y el Supervisor del Subcontrato (esta app es de uso exclusivo para Icafal)."""
     aviso_id = next_aviso_id()
@@ -1343,7 +1343,7 @@ def crear_aviso_desde_reporte(reporte_id: str, grupo_via: str, ubicacion: str, r
         "AvisoID": aviso_id, "Activo": f"Reporte Diario · Grupo Vía {grupo_via}",
         "Ubicacion": ubicacion or f"Grupo Vía {grupo_via}", "Prioridad": "Media", "Tipificacion": "Reporte Diario",
         "FechaHora": now_str(), "Descripcion": resumen_texto, "Adjunto": "",
-        "CreadoPor": st.session_state.usuario, "RolCreador": "Personal Terreno",
+        "CreadoPor": creado_por or st.session_state.usuario, "RolCreador": "Personal Terreno",
         "Estado": "Nuevo", "OT_Creada": False,
         "ValidacionNivel": "Sacyr", "RolFinal": "Supervisor Subcontrato", "ReporteID": reporte_id,
         "AprobadoSacyr": False, "ObsSacyr": "", "FechaValSacyr": "", "RespValSacyr": "",
@@ -1354,6 +1354,28 @@ def crear_aviso_desde_reporte(reporte_id: str, grupo_via: str, ubicacion: str, r
     st.session_state.avisos = pd.concat([st.session_state.avisos, pd.DataFrame([new_row])], ignore_index=True)
     save_all_avisos()
     return aviso_id
+
+def reconciliar_avisos_faltantes() -> int:
+    """Recrea Avisos para Reportes Diarios que ya existen (en Sheets o excel local) pero no
+    tienen Aviso asociado. Pasa con reportes guardados ANTES de que Avisos también quedara
+    guardado en Sheets: el Aviso vivía solo en el SQLite efímero de Streamlit Cloud y se
+    perdió en un reinicio, aunque el Reporte real (hojas Reportes/Trabajos) siguió intacto.
+    Quedan como 'Nuevo' -- el estado de aprobación que hubieran tenido antes no es
+    recuperable porque nunca quedó guardado de forma durable."""
+    df_rep = _leer_hoja_df("Reportes")
+    if df_rep.empty:
+        return 0
+    existentes = set(st.session_state.avisos["ReporteID"].astype(str)) if not st.session_state.avisos.empty else set()
+    faltantes = df_rep[~df_rep["ReporteID"].astype(str).isin(existentes)]
+    for _, rep in faltantes.iterrows():
+        ubicacion = rep.get("Ubicacion")
+        ubicacion = ubicacion if isinstance(ubicacion, str) and ubicacion.strip() else ""
+        crear_aviso_desde_reporte(
+            str(rep["ReporteID"]), str(rep.get("GrupoVia") or ""), ubicacion,
+            f"Reporte Diario recuperado del histórico ({rep.get('Fecha')}).",
+            creado_por=rep.get("Usuario") or "Personal Terreno",
+        )
+    return len(faltantes)
 
 def equipos_seleccionados():
     seleccion = [
@@ -1731,6 +1753,21 @@ def validador_inicio():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="btn_backup_reportes", width="stretch",
         )
+
+    with st.expander("⚙️ Avanzado"):
+        st.caption(
+            "Si un Reporte Diario aparece en el respaldo pero no en el Backlog de Avisos, "
+            "es porque el Aviso quedó atrapado antes de que Avisos también quedara guardado "
+            "en Google Sheets. Este botón recrea los avisos que falten (quedan como 'Nuevo', "
+            "listos para validar; el estado de aprobación anterior no es recuperable)."
+        )
+        if st.button("🔄 Recuperar avisos faltantes desde Reportes Diarios", key="btn_reconciliar_avisos"):
+            n = reconciliar_avisos_faltantes()
+            if n:
+                st.success(f"Se recrearon {n} aviso(s) que faltaban ✅")
+            else:
+                st.info("No hay avisos faltantes por recuperar.")
+            st.rerun()
 
     st.markdown("<div style='text-align:center;opacity:.5;padding-top:10px;'>sacyr</div>", unsafe_allow_html=True)
 
