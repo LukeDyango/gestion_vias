@@ -207,7 +207,7 @@ FOTOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fotos_repo
 
 REPORTES_SHEETS = {
     "Reportes": ["ReporteID", "Fecha", "GrupoVia", "Usuario", "Observaciones", "FechaCreacion", "Ubicacion"],
-    "Trabajos": ["ReporteID", "Actividad", "KmDesde", "KmHasta", "Unidad", "Cantidad", "Hombres", "HH"],
+    "Trabajos": ["ReporteID", "Actividad", "Collera", "KmDesde", "KmHasta", "Unidad", "Cantidad", "Hombres", "HH"],
     "Equipos": ["ReporteID", "Equipo", "Cantidad"],
     "Materiales": ["ReporteID", "Material", "Cantidad", "Estado"],
     "Asistencia": ["ReporteID", "Trabajador", "Cargo", "Estado", "HoraIngreso", "HoraSalida", "HorasExtras"],
@@ -236,16 +236,17 @@ ACTIVIDADES_TRABAJO = [
     "Mantenimiento de Desviador",
     "Mantenimiento de Desvíos",
     "Mantenimiento Cruce a Nivel",
-    "Mantenimiento de Cruce Peatonal",
-    "Mantenimiento de Alcantarillas",
-    "Mantenimiento de Cunetas",
+    "Mantenimiento de Cruce peatonal",
+    "Mantenimiento de alcantarillas",
+    "Mantenimiento de cunetas",
     "Reparación/Reposición de Señalización Pare",
     "Reparación/Reposición de Señal Cruce Pito",
     "Reparación/Reposición de Baliza PK",
-    "Control de vegetación y retiro de desechos",
+    "Control vegetación y retiro de desechos",
+    "Otras actividades",
 ]
 
-UNIDADES_TRABAJO = ["ml", "un", "m3", "km"]
+UNIDADES_TRABAJO = ["Kmv", "Und", "mlv", "H-H"]
 
 MESES_ES = [
     "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
@@ -303,8 +304,18 @@ def _hoja_sheets(spreadsheet, nombre_hoja: str):
         ws = spreadsheet.add_worksheet(title=nombre_hoja, rows=2000, cols=max(len(headers), 10))
         ws.append_row(headers)
         return ws
-    if not ws.row_values(1):
+    header_row = ws.row_values(1)
+    if not header_row:
         ws.append_row(headers)
+    else:
+        # Si el esquema creció (p.ej. se agregó una columna nueva) y esta hoja ya
+        # existía en el Sheet real, agregamos los encabezados faltantes al final,
+        # igual que migrate_reportes_excel() ya hace para el Excel local.
+        faltantes = [h for h in headers if h not in header_row]
+        if faltantes:
+            base_col = len(header_row)
+            for i, h in enumerate(faltantes):
+                ws.update_cell(1, base_col + i + 1, h)
     return ws
 
 def _leer_hoja_df(nombre_hoja: str) -> pd.DataFrame:
@@ -484,11 +495,11 @@ def _resolver_nombre(item: dict) -> str:
 # Encabezados del resumen "plano" (una fila por actividad; Equipo/Materiales/Fotos-Observación/
 # Asistencia van cada uno en una sola celda, con sus varios valores separados por coma).
 FLAT_HEADERS = [
-    "Grupo Vía", "Jefe de Grupo", "Fecha", "Ubicación", "Trabajo Realizado", "Km Desde", "Km Hasta",
+    "Grupo Vía", "Jefe de Grupo", "Fecha", "Ubicación", "Trabajo Realizado", "Collera", "Km Desde", "Km Hasta",
     "Unidad", "Cantidad", "Horas Trabajadas", "Equipo Utilizado", "Materiales",
     "Fotos / Observación", "Asistencia",
 ]
-FLAT_COL_WIDTHS = [12, 18, 12, 25, 30, 10, 10, 8, 10, 14, 30, 30, 35, 35]
+FLAT_COL_WIDTHS = [12, 18, 12, 25, 30, 10, 10, 10, 8, 10, 14, 30, 30, 35, 35]
 
 def _texto_equipos(equipos) -> str:
     return ", ".join(f"{e['nombre']} ({e['cantidad']:.0f})" for e in equipos) or "—"
@@ -543,7 +554,7 @@ def generar_excel_reporte(resumen: dict) -> bytes:
     for t in resumen["trabajos"]:
         ws.append([
             resumen["grupo_via"], resumen["usuario"], resumen["fecha"], resumen.get("ubicacion") or "—",
-            t["actividad"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hh"],
+            t["actividad"], t["collera"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hh"],
             equipo_txt, material_txt, fotos_obs_txt, asistencia_txt,
         ])
     _ajustar_anchos_columnas(ws, FLAT_COL_WIDTHS)
@@ -581,9 +592,9 @@ def generar_pdf_reporte(resumen: dict) -> bytes:
     el.append(Spacer(1, 12))
 
     el.append(Paragraph("Trabajos", styles["Heading2"]))
-    data = [["Actividad", "Km Desde", "Km Hasta", "Unidad", "Cant.", "N° Trab.", "HH"]]
+    data = [["Actividad", "Collera", "Km Desde", "Km Hasta", "Unidad", "Cant.", "N° Trab.", "HH"]]
     for t in resumen["trabajos"]:
-        data.append([t["actividad"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hombres"], t["hh"]])
+        data.append([t["actividad"], t["collera"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hombres"], t["hh"]])
     el.append(_tabla_pdf(data))
     el.append(Spacer(1, 10))
 
@@ -692,7 +703,7 @@ def generar_respaldo_plano() -> bytes | None:
         for _, t in trabajos_rep.iterrows():
             ws.append([
                 rep["GrupoVia"], rep["Usuario"], rep["Fecha"], ubicacion_txt,
-                t["Actividad"], t["KmDesde"], t["KmHasta"], t["Unidad"], t["Cantidad"], t["HH"],
+                t["Actividad"], t.get("Collera", ""), t["KmDesde"], t["KmHasta"], t["Unidad"], t["Cantidad"], t["HH"],
                 equipo_txt, material_txt, fotos_obs_txt, asistencia_txt,
             ])
 
@@ -857,7 +868,7 @@ def new_row_id():
     return uuid.uuid4().hex[:8]
 
 def new_trabajo_row():
-    return {"id": new_row_id(), "actividad": ACTIVIDADES_TRABAJO[0], "km_desde": "", "km_hasta": "",
+    return {"id": new_row_id(), "actividad": ACTIVIDADES_TRABAJO[0], "collera": 0, "km_desde": "", "km_hasta": "",
             "unidad": UNIDADES_TRABAJO[0], "cantidad": 0.0, "hombres": 0}
 
 def new_material_row():
@@ -1162,7 +1173,11 @@ def render_trabajos_section():
                 )
             with c4:
                 row["cantidad"] = st.number_input("Cantidad", min_value=0.0, value=float(row["cantidad"]), step=1.0, key=f"trab_cant_{rid}")
-            row["hombres"] = st.number_input("N° Trabajadores (Hombre)", min_value=0, value=int(row["hombres"]), step=1, key=f"trab_hom_{rid}")
+            c5, c6 = st.columns(2)
+            with c5:
+                row["hombres"] = st.number_input("N° Trabajadores (Hombre)", min_value=0, value=int(row["hombres"]), step=1, key=f"trab_hom_{rid}")
+            with c6:
+                row["collera"] = st.number_input("Collera", min_value=0, value=int(row.get("collera", 0)), step=1, key=f"trab_col_{rid}")
             if st.button("🗑 Eliminar actividad", key=f"trab_del_{rid}"):
                 st.session_state.reporte_trabajos = [r for r in st.session_state.reporte_trabajos if r["id"] != rid]
                 st.rerun()
@@ -1318,7 +1333,7 @@ def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_su
 
     trabajos_calc = [{**t, "hh": t["hombres"] * horas_dia} for t in trabajos]
     trabajos_rows = [
-        [reporte_id, t["actividad"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hombres"], t["hh"]]
+        [reporte_id, t["actividad"], t["collera"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hombres"], t["hh"]]
         for t in trabajos_calc
     ]
     equipos_usados = equipos_seleccionados()
@@ -1874,6 +1889,34 @@ def validador_ots():
 def page_planificacion():
     app_header("Planificación", back_page="Inicio")
     perfil_bar()
+
+    with st.expander("📤 Cargar planificación completa desde CSV (reemplaza TODO lo guardado)"):
+        st.caption(
+            "El archivo debe tener las columnas Actividad, Unidad, Anio, Mes, CantidadPlanificada "
+            "(una fila por actividad y mes). Esto reemplaza toda la hoja PlanMensual — todos los "
+            "años y meses guardados hasta ahora — no solo el mes que se ve más abajo."
+        )
+        archivo_csv = st.file_uploader("Archivo CSV", type=["csv"], key="plan_csv_uploader")
+        if archivo_csv is not None:
+            try:
+                df_csv = pd.read_csv(archivo_csv)
+                columnas_esperadas = {"Actividad", "Unidad", "Anio", "Mes", "CantidadPlanificada"}
+                faltantes = columnas_esperadas - set(df_csv.columns)
+                if faltantes:
+                    st.error(f"Faltan columnas en el archivo: {', '.join(sorted(faltantes))}")
+                else:
+                    st.dataframe(df_csv.head(10), hide_index=True, width="stretch")
+                    st.caption(f"{len(df_csv)} filas detectadas.")
+                    if st.button("⚠️ Reemplazar toda la planificación con este archivo", key="btn_cargar_plan_csv"):
+                        filas_csv = [
+                            [r["Actividad"], r["Unidad"], int(r["Anio"]), int(r["Mes"]), float(r["CantidadPlanificada"])]
+                            for _, r in df_csv.iterrows()
+                        ]
+                        guardar_plan_mensual(filas_csv)
+                        st.success(f"Planificación cargada: {len(filas_csv)} filas ✅")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo leer el archivo: {e}")
 
     hoy = datetime.now()
     c1, c2 = st.columns(2)
