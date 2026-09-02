@@ -109,7 +109,9 @@ st.markdown(MOBILE_CSS, unsafe_allow_html=True)
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "registros_app3.db")
 
 def get_db():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 # Columnas del tercer nivel de validación, específicas por rol (EFE o Supervisor Subcontrato)
 AVISO_COLUMNS = [
@@ -123,6 +125,12 @@ AVISO_COLUMNS = [
 ]
 
 OTS_COLUMNS = ["OTID", "AvisoID", "Activo", "Responsable", "FechaProgramada", "EstadoOT"]
+
+# Control de Durmientes por Collera (Norma NS-01-01-00)
+COLLERAS_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "colleras_catalogo.csv")
+DURMIENTES_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "durmientes_estado_completo.csv")
+DURMIENTES_COLUMNS = ["ColleraID", "Posicion", "Estado", "FechaActualizacion", "ReporteID"]
+ESTADOS_DURMIENTE = ["Bueno", "Malo", "Nuevo", "Reemplazado"]
 
 def init_db():
     conn = get_db()
@@ -146,6 +154,31 @@ def init_db():
         OTID TEXT PRIMARY KEY,
         AvisoID TEXT, Activo TEXT, Responsable TEXT, FechaProgramada TEXT, EstadoOT TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS colleras (
+        ColleraID TEXT PRIMARY KEY, PK INTEGER, Collera INTEGER,
+        Ubicacion TEXT, KmDesde REAL, KmHasta REAL
+    )""")
+    # Sin PRIMARY KEY compuesta a propósito: es un historial de cambios (una fila por
+    # modificación real), no "última foto" -- cada inspección que cambia un durmiente
+    # agrega una fila nueva en vez de sobreescribir la anterior.
+    c.execute("""CREATE TABLE IF NOT EXISTS durmientes_estado (
+        ColleraID TEXT, Posicion INTEGER, Estado TEXT,
+        FechaActualizacion TEXT, ReporteID TEXT
+    )""")
+
+    # Catálogo de colleras: geometría prácticamente inmutable, se siembra una sola vez desde
+    # el CSV que viaja junto a la app (así sobrevive a que Streamlit Cloud reinicie el disco
+    # local, sin depender de Google Sheets para 2404 filas de datos estáticos).
+    c.execute("SELECT COUNT(*) FROM colleras")
+    if c.fetchone()[0] == 0 and os.path.exists(COLLERAS_CSV_PATH):
+        import csv as _csv
+        with open(COLLERAS_CSV_PATH, encoding="utf-8") as f:
+            filas_colleras = [
+                (r["ColleraID"], int(r["PK"]), int(r["Collera"]), r["Ubicacion"],
+                 float(r["Km_Desde"]), float(r["Km_Hasta"]))
+                for r in _csv.DictReader(f)
+            ]
+        c.executemany("INSERT OR REPLACE INTO colleras VALUES (?,?,?,?,?,?)", filas_colleras)
 
     # Migración: agrega columnas nuevas si la tabla avisos ya existía con el esquema anterior (sin romper datos previos)
     c.execute("PRAGMA table_info(avisos)")
@@ -229,6 +262,168 @@ def save_all_ots():
     _sincronizar_tabla_sheets("OTs", df.values.tolist())
 
 # -------------------------
+# Control de Durmientes por Collera (catálogo geométrico + estado real)
+# -------------------------
+def cargar_colleras_de_pk(pk: int) -> list:
+    conn = get_db()
+    filas = conn.execute(
+        "SELECT ColleraID, Collera, KmDesde, KmHasta FROM colleras WHERE PK=? ORDER BY Collera",
+        (pk,)).fetchall()
+    conn.close()
+    return [dict(f) for f in filas]
+
+def cargar_todas_colleras() -> pd.DataFrame:
+    conn = get_db()
+    df = pd.read_sql("SELECT * FROM colleras", conn)
+    conn.close()
+    return df
+
+def load_durmientes_estado() -> pd.DataFrame:
+    """Estado real de los durmientes: Google Sheets es la fuente de verdad si está
+    configurado (así las inspecciones de terreno sobreviven a un reinicio de Streamlit
+    Cloud), si no se usa el SQLite local -- mismo criterio que load_avisos()/load_ots()."""
+    df = _leer_hoja_sheets_o_none("DurmientesEstado", DURMIENTES_COLUMNS)
+    if df is None:
+        conn = get_db()
+        try:
+            df = pd.read_sql("SELECT * FROM durmientes_estado", conn)
+        except Exception:
+            df = pd.DataFrame(columns=DURMIENTES_COLUMNS)
+        conn.close()
+    if not df.empty:
+        df["Posicion"] = df["Posicion"].apply(lambda v: int(_num(v)))
+    return df
+
+def _seed_durmientes_estado_inicial() -> pd.DataFrame:
+    """La primera vez que corre la app (tabla/hoja de estado todavía vacía), siembra las
+    pocas colleras que el catastro ya trae con datos reales -- igual criterio que colleras,
+    pero acá NO se reintenta en cada init: solo corre mientras el estado esté vacío, para
+    no pisar inspecciones de terreno ya guardadas con el dato original del Excel."""
+    if not os.path.exists(DURMIENTES_CSV_PATH):
+        return pd.DataFrame(columns=DURMIENTES_COLUMNS)
+    import csv as _csv
+    filas = []
+    with open(DURMIENTES_CSV_PATH, encoding="utf-8") as f:
+        for r in _csv.DictReader(f):
+            for pos in range(1, 24):
+                val = r.get(f"D{pos}")
+                if val:
+                    filas.append({
+                        "ColleraID": r["ColleraID"], "Posicion": pos, "Estado": val,
+                        "FechaActualizacion": "", "ReporteID": "SEED-CATASTRO",
+                    })
+    return pd.DataFrame(filas, columns=DURMIENTES_COLUMNS)
+
+def save_all_durmientes_estado():
+    df = st.session_state.durmientes_estado.copy()
+    if not df.empty:
+        df = df[DURMIENTES_COLUMNS]
+    conn = get_db()
+    conn.execute("DELETE FROM durmientes_estado")
+    if not df.empty:
+        conn.executemany("INSERT INTO durmientes_estado VALUES (?,?,?,?,?)", df.values.tolist())
+    conn.commit()
+    conn.close()
+    _sincronizar_tabla_sheets("DurmientesEstado", df.values.tolist() if not df.empty else [])
+
+def _estado_vigente(df_estado: pd.DataFrame) -> pd.DataFrame:
+    """durmientes_estado es un historial de cambios (una fila por modificación real), no
+    'última foto'. Esta función deja solo la fila más reciente de cada (ColleraID,
+    Posicion) -- el estado vigente -- para usar en cumplimiento normativo y en el
+    formulario. Desempate estable por orden de inserción si dos cambios cayeron en el
+    mismo minuto (FechaActualizacion solo tiene precisión de minuto)."""
+    if df_estado.empty:
+        return df_estado
+    df = df_estado.copy()
+    df["_orden"] = range(len(df))
+    df = df.sort_values(["FechaActualizacion", "_orden"])
+    return df.groupby(["ColleraID", "Posicion"], as_index=False).tail(1).drop(columns="_orden")
+
+def cargar_estado_collera(collera_id: str) -> dict:
+    df = _estado_vigente(st.session_state.durmientes_estado)
+    if df.empty:
+        return {}
+    filas = df[df["ColleraID"] == collera_id]
+    return {int(r["Posicion"]): r["Estado"] for _, r in filas.iterrows()}
+
+def evaluar_collera(collera_id: str, ubicacion: str, df_estado_vigente: pd.DataFrame | None = None) -> dict:
+    """Replica exactamente la lógica de la hoja 'Control Durmientes' del Excel original
+    (Norma NS-01-01-00: mínimo 10 durmientes efectivos, racha máxima de 'Malo' según
+    Recta/Curva). `df_estado_vigente` debe ser el resultado de _estado_vigente() -- se
+    recibe ya calculado para no repetir el dedup en cada llamada dentro de un loop grande
+    (resumen_global_durmientes/resumen_por_pk evalúan las 2404 colleras)."""
+    if df_estado_vigente is None:
+        df_estado_vigente = _estado_vigente(st.session_state.durmientes_estado)
+    if df_estado_vigente.empty:
+        filas_collera = df_estado_vigente
+    else:
+        filas_collera = df_estado_vigente[df_estado_vigente["ColleraID"] == collera_id]
+    estados_por_posicion = {int(r["Posicion"]): r["Estado"] for _, r in filas_collera.iterrows()}
+    secuencia = [estados_por_posicion.get(p) for p in range(1, 24)]
+
+    total_registrado = sum(1 for e in secuencia if e)
+    n_buenos = secuencia.count("Bueno")
+    n_malos = secuencia.count("Malo")
+    n_nuevos = secuencia.count("Nuevo")
+    n_reempl = secuencia.count("Reemplazado")
+    efectivos = n_buenos + n_nuevos + n_reempl
+    pct_renov = (n_nuevos + n_reempl) / total_registrado if total_registrado else 0.0
+
+    racha, racha_max = 0, 0
+    for e in secuencia:
+        racha = racha + 1 if e == "Malo" else 0
+        racha_max = max(racha_max, racha)
+
+    if total_registrado == 0:
+        estado_general = "Sin Inspeccionar"
+    else:
+        limite_racha = 2 if "Curva" in (ubicacion or "") else 3
+        cumple_minimo = efectivos >= 10          # Norma 6.5.3
+        cumple_racha = racha_max <= limite_racha  # Norma 6.5.4
+        estado_general = "Cumple" if (cumple_minimo and cumple_racha) else "No Cumple"
+
+    return {
+        "total_registrado": total_registrado, "n_buenos": n_buenos, "n_malos": n_malos,
+        "n_nuevos": n_nuevos, "n_reempl": n_reempl, "efectivos": efectivos,
+        "pct_renovacion": pct_renov, "racha_max": racha_max, "estado_general": estado_general,
+    }
+
+def resumen_global_durmientes() -> dict:
+    df_colleras = cargar_todas_colleras()
+    df_estado = _estado_vigente(st.session_state.durmientes_estado)
+    resultados = [evaluar_collera(row["ColleraID"], row["Ubicacion"], df_estado) for _, row in df_colleras.iterrows()]
+    cumplen = sum(1 for r in resultados if r["estado_general"] == "Cumple")
+    no_cumplen = sum(1 for r in resultados if r["estado_general"] == "No Cumple")
+    sin_datos = sum(1 for r in resultados if r["estado_general"] == "Sin Inspeccionar")
+    evaluables = cumplen + no_cumplen
+    pct_cumplimiento = (cumplen / evaluables * 100) if evaluables else 0.0
+    return {"total": len(resultados), "cumplen": cumplen, "no_cumplen": no_cumplen,
+            "sin_datos": sin_datos, "pct_cumplimiento": pct_cumplimiento}
+
+def resumen_por_pk() -> list:
+    """Una fila por PK: n° colleras, evaluadas, estado del km (Bueno/Regular/Malo/Sin Datos)."""
+    df_colleras = cargar_todas_colleras()
+    df_estado = _estado_vigente(st.session_state.durmientes_estado)
+    filas = []
+    for pk in sorted(df_colleras["PK"].unique()):
+        colleras_pk = df_colleras[df_colleras["PK"] == pk]
+        evals = [evaluar_collera(r["ColleraID"], r["Ubicacion"], df_estado) for _, r in colleras_pk.iterrows()]
+        n_total = len(evals)
+        n_con_datos = sum(1 for e in evals if e["total_registrado"] > 0)
+        n_no_cumplen = sum(1 for e in evals if e["estado_general"] == "No Cumple")
+        if n_con_datos == 0:
+            estado_km = "Sin Datos"
+        elif n_no_cumplen > 0:
+            estado_km = "Malo"
+        elif n_con_datos < n_total / 2:
+            estado_km = "Regular"
+        else:
+            estado_km = "Bueno"
+        filas.append({"PK": int(pk), "N° Colleras": n_total, "Con datos": n_con_datos,
+                      "No cumplen": n_no_cumplen, "Estado KM": estado_km})
+    return filas
+
+# -------------------------
 # Reporte Diario (Personal Terreno) - base de datos en Excel
 # -------------------------
 REPORTES_XLSX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reportes_diarios.xlsx")
@@ -236,7 +431,7 @@ FOTOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fotos_repo
 
 REPORTES_SHEETS = {
     "Reportes": ["ReporteID", "Fecha", "GrupoVia", "Usuario", "Observaciones", "FechaCreacion", "Ubicacion"],
-    "Trabajos": ["ReporteID", "Actividad", "Collera", "KmDesde", "KmHasta", "Unidad", "Cantidad", "Hombres", "HH"],
+    "Trabajos": ["ReporteID", "Actividad", "ColleraDesdeID", "ColleraHastaID", "KmDesde", "KmHasta", "Unidad", "Cantidad", "Hombres", "HH"],
     "Equipos": ["ReporteID", "Equipo", "Cantidad"],
     "Materiales": ["ReporteID", "Material", "Cantidad", "Estado"],
     "Asistencia": ["ReporteID", "Trabajador", "Cargo", "Estado", "HoraIngreso", "HoraSalida", "HorasExtras"],
@@ -244,6 +439,7 @@ REPORTES_SHEETS = {
     "PlanMensual": ["Actividad", "Unidad", "Anio", "Mes", "CantidadPlanificada"],
     "Avisos": AVISO_COLUMNS,
     "OTs": OTS_COLUMNS,
+    "DurmientesEstado": DURMIENTES_COLUMNS,
 }
 
 DIAS_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
@@ -538,11 +734,11 @@ def _resolver_nombre(item: dict) -> str:
 # Encabezados del resumen "plano" (una fila por actividad; Equipo/Materiales/Fotos-Observación/
 # Asistencia van cada uno en una sola celda, con sus varios valores separados por coma).
 FLAT_HEADERS = [
-    "Grupo Vía", "Jefe de Grupo", "Fecha", "Ubicación", "Trabajo Realizado", "Collera", "Km Desde", "Km Hasta",
-    "Unidad", "Cantidad", "Horas Trabajadas", "Equipo Utilizado", "Materiales",
+    "Grupo Vía", "Jefe de Grupo", "Fecha", "Ubicación", "Trabajo Realizado", "Collera Desde", "Collera Hasta",
+    "Km Desde", "Km Hasta", "Unidad", "Cantidad", "Horas Trabajadas", "Equipo Utilizado", "Materiales",
     "Fotos / Observación", "Asistencia",
 ]
-FLAT_COL_WIDTHS = [12, 18, 12, 25, 30, 10, 10, 10, 8, 10, 14, 30, 30, 35, 35]
+FLAT_COL_WIDTHS = [12, 18, 12, 25, 30, 10, 10, 10, 10, 8, 10, 14, 30, 30, 35, 35]
 
 def _texto_equipos(equipos) -> str:
     return ", ".join(f"{e['nombre']} ({e['cantidad']:.0f})" for e in equipos) or "—"
@@ -597,7 +793,7 @@ def generar_excel_reporte(resumen: dict) -> bytes:
     for t in resumen["trabajos"]:
         ws.append([
             resumen["grupo_via"], resumen["usuario"], resumen["fecha"], resumen.get("ubicacion") or "—",
-            t["actividad"], t["collera"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hh"],
+            t["actividad"], t["collera_desde_id"], t["collera_hasta_id"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hh"],
             equipo_txt, material_txt, fotos_obs_txt, asistencia_txt,
         ])
     _ajustar_anchos_columnas(ws, FLAT_COL_WIDTHS)
@@ -635,9 +831,9 @@ def generar_pdf_reporte(resumen: dict) -> bytes:
     el.append(Spacer(1, 12))
 
     el.append(Paragraph("Trabajos", styles["Heading2"]))
-    data = [["Actividad", "Collera", "Km Desde", "Km Hasta", "Unidad", "Cant.", "N° Trab.", "HH"]]
+    data = [["Actividad", "Collera Desde", "Collera Hasta", "Km Desde", "Km Hasta", "Unidad", "Cant.", "N° Trab.", "HH"]]
     for t in resumen["trabajos"]:
-        data.append([t["actividad"], t["collera"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hombres"], t["hh"]])
+        data.append([t["actividad"], t["collera_desde_id"], t["collera_hasta_id"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hombres"], t["hh"]])
     el.append(_tabla_pdf(data))
     el.append(Spacer(1, 10))
 
@@ -746,7 +942,7 @@ def generar_respaldo_plano() -> bytes | None:
         for _, t in trabajos_rep.iterrows():
             ws.append([
                 rep["GrupoVia"], rep["Usuario"], rep["Fecha"], ubicacion_txt,
-                t["Actividad"], t.get("Collera", ""), t["KmDesde"], t["KmHasta"], t["Unidad"], t["Cantidad"], t["HH"],
+                t["Actividad"], t.get("ColleraDesdeID", ""), t.get("ColleraHastaID", ""), t["KmDesde"], t["KmHasta"], t["Unidad"], t["Cantidad"], t["HH"],
                 equipo_txt, material_txt, fotos_obs_txt, asistencia_txt,
             ])
 
@@ -849,6 +1045,15 @@ def init_data():
         st.session_state.avisos = load_avisos()
     if "ots" not in st.session_state:
         st.session_state.ots = load_ots()
+    if "durmientes_estado" not in st.session_state:
+        df_estado = load_durmientes_estado()
+        if df_estado.empty:
+            df_estado = _seed_durmientes_estado_inicial()
+            st.session_state.durmientes_estado = df_estado
+            if not df_estado.empty:
+                save_all_durmientes_estado()
+        else:
+            st.session_state.durmientes_estado = df_estado
     if "selected_aviso" not in st.session_state:
         st.session_state.selected_aviso = None
     if "reporte_trabajos" not in st.session_state:
@@ -911,7 +1116,8 @@ def new_row_id():
     return uuid.uuid4().hex[:8]
 
 def new_trabajo_row():
-    return {"id": new_row_id(), "actividad": ACTIVIDADES_TRABAJO[0], "collera": 0, "km_desde": "", "km_hasta": "",
+    return {"id": new_row_id(), "actividad": ACTIVIDADES_TRABAJO[0], "pk": 33,
+            "collera_desde_id": "", "collera_hasta_id": "", "km_desde": "", "km_hasta": "",
             "unidad": UNIDADES_TRABAJO[0], "cantidad": 0.0, "hombres": 0}
 
 def new_material_row():
@@ -1202,11 +1408,31 @@ def render_trabajos_section():
                 index=ACTIVIDADES_TRABAJO.index(row["actividad"]) if row["actividad"] in ACTIVIDADES_TRABAJO else 0,
                 key=f"trab_act_{rid}",
             )
-            c1, c2 = st.columns(2)
-            with c1:
-                row["km_desde"] = st.text_input("Kilómetro Desde", value=row["km_desde"], key=f"trab_kmd_{rid}")
-            with c2:
-                row["km_hasta"] = st.text_input("Kilómetro Hasta", value=row["km_hasta"], key=f"trab_kmh_{rid}")
+            row["pk"] = st.number_input(
+                "PK", min_value=33, max_value=61, step=1, value=int(row.get("pk", 33)), key=f"trab_pk_{rid}",
+            )
+            colleras_pk = cargar_colleras_de_pk(row["pk"])
+            idx_desde = idx_hasta = None
+            if not colleras_pk:
+                st.warning(f"No hay colleras registradas para el PK {row['pk']}.")
+                row["km_desde"], row["km_hasta"] = "", ""
+                row["collera_desde_id"], row["collera_hasta_id"] = "", ""
+            else:
+                opciones = [f"Collera {c['Collera']} (km {c['KmDesde']:.3f}–{c['KmHasta']:.3f})" for c in colleras_pk]
+                cA, cB = st.columns(2)
+                with cA:
+                    collera_desde = st.selectbox("Collera Desde", opciones, key=f"trab_coldesde_{rid}")
+                with cB:
+                    collera_hasta = st.selectbox(
+                        "Collera Hasta", opciones, index=len(opciones) - 1, key=f"trab_colhasta_{rid}",
+                    )
+                idx_desde = opciones.index(collera_desde)
+                idx_hasta = opciones.index(collera_hasta)
+                row["km_desde"] = f"{colleras_pk[idx_desde]['KmDesde']:.3f}"
+                row["km_hasta"] = f"{colleras_pk[idx_hasta]['KmHasta']:.3f}"
+                row["collera_desde_id"] = colleras_pk[idx_desde]["ColleraID"]
+                row["collera_hasta_id"] = colleras_pk[idx_hasta]["ColleraID"]
+
             c3, c4 = st.columns(2)
             with c3:
                 row["unidad"] = st.selectbox(
@@ -1216,11 +1442,29 @@ def render_trabajos_section():
                 )
             with c4:
                 row["cantidad"] = st.number_input("Cantidad", min_value=0.0, value=float(row["cantidad"]), step=1.0, key=f"trab_cant_{rid}")
-            c5, c6 = st.columns(2)
-            with c5:
-                row["hombres"] = st.number_input("N° Trabajadores (Hombre)", min_value=0, value=int(row["hombres"]), step=1, key=f"trab_hom_{rid}")
-            with c6:
-                row["collera"] = st.number_input("Collera", min_value=0, value=int(row.get("collera", 0)), step=1, key=f"trab_col_{rid}")
+            row["hombres"] = st.number_input("N° Trabajadores (Hombre)", min_value=0, value=int(row["hombres"]), step=1, key=f"trab_hom_{rid}")
+
+            if colleras_pk and row["actividad"] == "Inspección Vía" and idx_desde == idx_hasta:
+                with st.expander("📋 Registrar estado de durmientes de esta collera"):
+                    collera_id = row["collera_desde_id"]
+                    estados_actuales = cargar_estado_collera(collera_id)
+                    opciones_estado = ["", "Bueno", "Malo", "Nuevo", "Reemplazado"]
+                    nuevos_estados = {}
+                    cols_durm = st.columns(4)
+                    for pos in range(1, 24):
+                        with cols_durm[(pos - 1) % 4]:
+                            valor_actual = estados_actuales.get(pos, "")
+                            nuevos_estados[pos] = st.selectbox(
+                                f"D{pos}", opciones_estado,
+                                index=opciones_estado.index(valor_actual) if valor_actual in opciones_estado else 0,
+                                key=f"durm_{rid}_{pos}",
+                            )
+                    row["durmientes_collera_id"] = collera_id
+                    row["durmientes_estados"] = nuevos_estados
+            else:
+                row.pop("durmientes_collera_id", None)
+                row.pop("durmientes_estados", None)
+
             if st.button("🗑 Eliminar actividad", key=f"trab_del_{rid}"):
                 st.session_state.reporte_trabajos = [r for r in st.session_state.reporte_trabajos if r["id"] != rid]
                 st.rerun()
@@ -1386,6 +1630,37 @@ def equipos_seleccionados():
     seleccion += [{"nombre": o["nombre"], "cantidad": o["cantidad"]} for o in st.session_state.reporte_equipos_otros]
     return seleccion
 
+def _registrar_cambios_durmientes(reporte_id: str, fecha_str: str, trabajos: list):
+    """Registra el estado de durmientes reportado en terreno como historial de cambios:
+    si el valor reportado es igual al vigente no agrega nada (evita ensuciar el historial
+    con 'confirmaciones' sin cambio real); si es distinto, agrega una fila NUEVA -- nunca
+    sobreescribe una fila anterior -- para poder auditar cuándo y en qué reporte cambió
+    cada durmiente. Deja en blanco = no tocar lo que ya había (no se asume 'Bueno' por
+    defecto, igual que el Excel)."""
+    df_vigente = _estado_vigente(st.session_state.durmientes_estado)
+    filas_nuevas = []
+    for t in trabajos:
+        estados = t.get("durmientes_estados")
+        collera_id = t.get("durmientes_collera_id")
+        if not estados or not collera_id:
+            continue
+        for pos, estado in estados.items():
+            if not estado:
+                continue
+            if not df_vigente.empty:
+                anterior = df_vigente[(df_vigente["ColleraID"] == collera_id) & (df_vigente["Posicion"] == pos)]
+            else:
+                anterior = df_vigente
+            estado_previo = anterior.iloc[0]["Estado"] if not anterior.empty else None
+            if estado == estado_previo:
+                continue
+            filas_nuevas.append({"ColleraID": collera_id, "Posicion": pos, "Estado": estado,
+                                 "FechaActualizacion": fecha_str, "ReporteID": reporte_id})
+    if filas_nuevas:
+        st.session_state.durmientes_estado = pd.concat(
+            [st.session_state.durmientes_estado, pd.DataFrame(filas_nuevas)], ignore_index=True)
+        save_all_durmientes_estado()
+
 def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_subidas):
     trabajos = st.session_state.reporte_trabajos
     if not trabajos:
@@ -1398,9 +1673,11 @@ def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_su
 
     trabajos_calc = [{**t, "hh": t["hombres"] * horas_dia} for t in trabajos]
     trabajos_rows = [
-        [reporte_id, t["actividad"], t["collera"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hombres"], t["hh"]]
+        [reporte_id, t["actividad"], t["collera_desde_id"], t["collera_hasta_id"],
+         t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hombres"], t["hh"]]
         for t in trabajos_calc
     ]
+    _registrar_cambios_durmientes(reporte_id, fecha_str, trabajos)
     equipos_usados = equipos_seleccionados()
     equipos_rows = [[reporte_id, e["nombre"], e["cantidad"]] for e in equipos_usados]
     materiales_rows = [
@@ -1741,6 +2018,9 @@ def validador_inicio():
     if st.button("📅  Planificación (Plan vs Ejecutado)", key="btn_planificacion"):
         st.session_state.page = "Planificación"
         st.rerun()
+    if st.button("🛤️  Durmientes (Norma NS-01-01-00)", key="btn_durmientes"):
+        st.session_state.page = "Durmientes"
+        st.rerun()
     if st.button("📊  Reportes (Demo)", key="btn_reportes"):
         st.info("Próximamente: dashboard de KPIs.")
 
@@ -1989,7 +2269,8 @@ def page_planificacion():
                     st.caption(f"{len(df_csv)} filas detectadas.")
                     if st.button("⚠️ Reemplazar toda la planificación con este archivo", key="btn_cargar_plan_csv"):
                         filas_csv = [
-                            [r["Actividad"], r["Unidad"], int(r["Anio"]), int(r["Mes"]), float(r["CantidadPlanificada"])]
+                            [r["Actividad"], r["Unidad"], int(r["Anio"]), int(r["Mes"]),
+                             float(str(r["CantidadPlanificada"]).replace(",", "."))]
                             for _, r in df_csv.iterrows()
                         ]
                         guardar_plan_mensual(filas_csv)
@@ -2034,7 +2315,7 @@ def page_planificacion():
         column_config={
             "Actividad": st.column_config.TextColumn(disabled=True),
             "Unidad": st.column_config.SelectboxColumn(options=UNIDADES_TRABAJO),
-            "Planificado": st.column_config.NumberColumn(min_value=0.0, step=1.0),
+            "Planificado": st.column_config.NumberColumn(min_value=0.0, step=0.001, format="%.3f"),
         },
     )
 
@@ -2070,6 +2351,58 @@ def page_planificacion():
         })
     st.dataframe(pd.DataFrame(filas_comparacion), hide_index=True, width="stretch")
 
+def page_dashboard_durmientes():
+    app_header("Control de Durmientes", back_page="Inicio")
+    perfil_bar()
+    st.caption("Cumplimiento de la Norma NS-01-01-00: mínimo 10 durmientes efectivos por collera y racha máxima de 'Malo' consecutivos (2 en curva, 3 en recta).")
+
+    resumen = resumen_global_durmientes()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Colleras registradas", resumen["total"])
+    c2.metric("Cumplen", resumen["cumplen"])
+    c3.metric("No cumplen", resumen["no_cumplen"])
+    c4.metric("% cumplimiento", f"{resumen['pct_cumplimiento']:.0f}%")
+
+    st.divider()
+    st.markdown("#### Mapa de condición por PK")
+    color = {"Bueno": "#2FA84F", "Regular": "#E0A458", "Malo": "#DC3545", "Sin Datos": "#B0B5BB"}
+    filas = resumen_por_pk()
+    cols = st.columns(len(filas))
+    for col, f in zip(cols, filas):
+        with col:
+            estado_km = f["Estado KM"]
+            st.markdown(
+                f"<div style='background:{color[estado_km]};height:40px;border-radius:6px;"
+                f"text-align:center;color:#fff;font-size:11px;padding-top:4px;' title='{estado_km}'>{f['PK']}</div>",
+                unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown("#### Detalle por PK")
+    st.dataframe(pd.DataFrame(filas), hide_index=True, width="stretch")
+
+    st.divider()
+    st.markdown("#### Buscar una collera")
+    pk_buscar = st.number_input("PK", min_value=33, max_value=61, step=1, key="durm_dash_pk")
+    colleras_pk = cargar_colleras_de_pk(pk_buscar)
+    if colleras_pk:
+        opciones = [f"Collera {c['Collera']} ({c['ColleraID']})" for c in colleras_pk]
+        seleccion = st.selectbox("Collera", opciones, key="durm_dash_collera")
+        idx = opciones.index(seleccion)
+        c = colleras_pk[idx]
+        df_colleras = cargar_todas_colleras()
+        ubicacion = df_colleras[df_colleras["ColleraID"] == c["ColleraID"]]["Ubicacion"].iloc[0]
+        ev = evaluar_collera(c["ColleraID"], ubicacion)
+        badge_kind = {"Cumple": "ok", "No Cumple": "bad", "Sin Inspeccionar": "muted"}.get(ev["estado_general"], "info")
+        badge(ev["estado_general"], badge_kind)
+        st.write(f"**{c['ColleraID']}** · {ubicacion} · km {c['KmDesde']:.3f}–{c['KmHasta']:.3f}")
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        cc1.metric("Efectivos", ev["efectivos"])
+        cc2.metric("Malos", ev["n_malos"])
+        cc3.metric("Racha máx. Malo", ev["racha_max"])
+        cc4.metric("% renovación", f"{ev['pct_renovacion'] * 100:.0f}%")
+    else:
+        st.info("No hay colleras registradas para este PK.")
+
 def flujo_validador():
     page = st.session_state.page
     if page == "Inicio":
@@ -2084,6 +2417,8 @@ def flujo_validador():
         validador_ots()
     elif page == "Planificación":
         page_planificacion()
+    elif page == "Durmientes":
+        page_dashboard_durmientes()
     else:
         st.session_state.page = "Inicio"
         st.rerun()
