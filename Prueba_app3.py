@@ -206,7 +206,11 @@ def _leer_hoja_sheets_o_none(nombre_hoja: str, columnas: list):
         return None
     try:
         ws = _hoja_sheets(sh, nombre_hoja)
-        registros = ws.get_all_records()
+        # UNFORMATTED_VALUE: sin esto, Sheets entrega los números ya "formateados" como
+        # texto según el locale de la hoja (chileno: coma decimal) -- ej. "46,644" -- y esa
+        # coma se interpreta como separador de miles (asumiendo locale inglés), quedando
+        # 46644. UNFORMATTED_VALUE trae el número real de vuelta, sin pasar por texto.
+        registros = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
         return pd.DataFrame(registros) if registros else pd.DataFrame(columns=columnas)
     except Exception:
         return None
@@ -553,7 +557,10 @@ def _leer_hoja_df(nombre_hoja: str) -> pd.DataFrame:
     if sh is not None:
         try:
             ws = _hoja_sheets(sh, nombre_hoja)
-            registros = ws.get_all_records()
+            # UNFORMATTED_VALUE: evita que Sheets entregue los números como texto ya
+            # formateado según el locale (coma decimal chilena), que se leería mal
+            # (ver _leer_hoja_sheets_o_none más arriba para el detalle del bug).
+            registros = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
             # Sin filas de datos, get_all_records() devuelve [] y pd.DataFrame([]) queda sin
             # columnas -- forzamos las columnas esperadas para que df["ReporteID"] no reviente.
             return pd.DataFrame(registros) if registros else pd.DataFrame(columns=columnas)
