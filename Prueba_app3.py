@@ -14,10 +14,11 @@ from PIL import Image as PILImage, ImageOps
 import gspread
 from google.oauth2.service_account import Credentials as GoogleCredentials
 from streamlit_geolocation import streamlit_geolocation
+import altair as alt
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
 
 st.set_page_config(page_title="efe · Trenes & CHILE", page_icon="🚆", layout="centered", initial_sidebar_state="collapsed")
@@ -741,6 +742,24 @@ def ejecutado_por_actividad(anio: int, mes: int) -> dict:
     trab_mes["Cantidad"] = trab_mes["Cantidad"].apply(_num)
     return trab_mes.groupby("Actividad")["Cantidad"].sum().to_dict()
 
+def _ciclo_anual(anio: int, mes: int) -> list:
+    """Los 12 (Año, Mes) del ciclo de mantención Septiembre-Agosto que contiene el mes
+    dado (ej. Ene 2027 cae en el ciclo Sep 2026-Ago 2027, igual que el Excel del cliente)."""
+    inicio_anio = anio if mes >= 9 else anio - 1
+    return [(inicio_anio if m >= 9 else inicio_anio + 1, m) for m in [9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8]]
+
+def meta_anual_por_actividad(df_plan: pd.DataFrame, anio: int, mes: int) -> dict:
+    """Suma la Cantidad Planificada de cada actividad en todo el ciclo Sep-Ago que
+    contiene (anio, mes) -- la meta anual completa, no solo la del mes seleccionado."""
+    if df_plan.empty:
+        return {}
+    ciclo = set(_ciclo_anual(anio, mes))
+    en_ciclo = df_plan.apply(lambda r: (int(_num(r["Anio"])), int(_num(r["Mes"]))) in ciclo, axis=1)
+    df_ciclo = df_plan[en_ciclo]
+    if df_ciclo.empty:
+        return {}
+    return df_ciclo.groupby("Actividad")["CantidadPlanificada"].apply(lambda s: s.apply(_num).sum()).to_dict()
+
 def _resolver_nombre(item: dict) -> str:
     if item["nombre"] == "Otro (especificar)":
         return item.get("nombre_custom", "").strip() or "Otro"
@@ -778,19 +797,58 @@ def _ajustar_anchos_columnas(ws, anchos):
     for i, ancho in enumerate(anchos, start=1):
         ws.column_dimensions[get_column_letter(i)].width = ancho
 
-def _tabla_pdf(data):
-    if len(data) <= 1:
-        data.append(["—"] * len(data[0]))
-    t = Table(data, repeatRows=1)
+PDF_ANCHO_UTIL = A4[0] - 3 * cm  # ancho usable con márgenes de 1.5cm a cada lado
+
+_ESTILO_CELDA_PDF = ParagraphStyle("celda_pdf", fontName="Helvetica", fontSize=8, leading=10, textColor=colors.HexColor("#222222"))
+_ESTILO_CELDA_PDF_HEADER = ParagraphStyle("celda_pdf_header", fontName="Helvetica-Bold", fontSize=8, leading=10, textColor=colors.white)
+
+def _celda_pdf(valor, header=False) -> Paragraph:
+    texto = "—" if valor in (None, "") else str(valor)
+    return Paragraph(texto, _ESTILO_CELDA_PDF_HEADER if header else _ESTILO_CELDA_PDF)
+
+def _tabla_pdf(headers, filas, col_widths):
+    """Tabla con anchos de columna fijos y texto envuelto en Paragraph, para que nombres
+    largos (actividad, material) se ajusten en vez de desbordar o descuadrar la tabla."""
+    data = [[_celda_pdf(h, header=True) for h in headers]]
+    if filas:
+        for fila in filas:
+            data.append([_celda_pdf(v) for v in fila])
+    else:
+        data.append([_celda_pdf("Sin registros")] + [_celda_pdf("") for _ in headers[1:]])
+    t = Table(data, colWidths=col_widths, repeatRows=1)
     t.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B3B8A")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#C7CCD4")),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F1F3F6")]),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
     ]))
     return t
+
+def _seccion_pdf(titulo: str) -> Table:
+    """Barra de título de sección (celeste con texto azul), consistente en todo el PDF."""
+    t = Table([[titulo]], colWidths=[PDF_ANCHO_UTIL])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#EEF2FA")),
+        ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#0B3B8A")),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    return t
+
+def _pie_pagina_pdf(canvas, doc, reporte_id: str):
+    canvas.saveState()
+    canvas.setFont("Helvetica", 7)
+    canvas.setFillColor(colors.HexColor("#8A8F98"))
+    canvas.drawString(1.5 * cm, 0.9 * cm, f"Reporte Diario {reporte_id} · Generado {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+    canvas.drawRightString(A4[0] - 1.5 * cm, 0.9 * cm, f"Página {doc.page}")
+    canvas.restoreState()
 
 def generar_excel_reporte(resumen: dict) -> bytes:
     """Genera un Excel individual (no el libro maestro): una fila por actividad, con Equipo,
@@ -832,53 +890,82 @@ def generar_excel_reporte(resumen: dict) -> bytes:
 
 def generar_pdf_reporte(resumen: dict) -> bytes:
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.5 * cm, bottomMargin=1.5 * cm,
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.5 * cm, bottomMargin=1.8 * cm,
                              leftMargin=1.5 * cm, rightMargin=1.5 * cm)
     styles = getSampleStyleSheet()
     el = []
-    el.append(Paragraph(f"Reporte Diario {resumen['reporte_id']}", styles["Title"]))
-    el.append(Paragraph(
-        f"Grupo Vía: {resumen['grupo_via']} · Fecha: {resumen['fecha']} · Jefe de Grupo: {resumen['usuario']} · "
-        f"Jornada: {resumen['horas_dia']} h/trabajador",
-        styles["Normal"],
-    ))
-    el.append(Paragraph(f"Ubicación: {resumen.get('ubicacion') or '—'}", styles["Normal"]))
+
+    # Encabezado con color de marca (en vez del título plano de antes)
+    estilo_banner = ParagraphStyle("banner_pdf", fontName="Helvetica-Bold", fontSize=14, textColor=colors.white)
+    banner = Table([[Paragraph(f"REPORTE DIARIO — {resumen['reporte_id']}", estilo_banner)]], colWidths=[PDF_ANCHO_UTIL])
+    banner.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#0B3B8A")),
+        ("TOPPADDING", (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12),
+    ]))
+    el.append(banner)
+    el.append(Spacer(1, 10))
+
+    # Ficha de datos generales (etiqueta/valor en grilla, no un párrafo corrido)
+    estilo_etiqueta = ParagraphStyle("etiqueta_pdf", fontName="Helvetica-Bold", fontSize=9, textColor=colors.HexColor("#0B3B8A"))
+    estilo_valor = ParagraphStyle("valor_pdf", fontName="Helvetica", fontSize=9, textColor=colors.HexColor("#222222"))
+    mitad = PDF_ANCHO_UTIL / 2 - 85
+    info_data = [
+        [Paragraph("Grupo Vía", estilo_etiqueta), Paragraph(str(resumen["grupo_via"]), estilo_valor),
+         Paragraph("Fecha", estilo_etiqueta), Paragraph(str(resumen["fecha"]), estilo_valor)],
+        [Paragraph("Jefe de Grupo", estilo_etiqueta), Paragraph(str(resumen["usuario"]), estilo_valor),
+         Paragraph("Jornada", estilo_etiqueta), Paragraph(f"{resumen['horas_dia']} h/trabajador", estilo_valor)],
+        [Paragraph("Ubicación", estilo_etiqueta), Paragraph(str(resumen.get("ubicacion") or "—"), estilo_valor), "", ""],
+    ]
+    info_table = Table(info_data, colWidths=[85, mitad, 85, mitad])
+    info_table.setStyle(TableStyle([
+        ("SPAN", (1, 2), (3, 2)),
+        ("LINEBELOW", (0, 0), (-1, -2), 0.4, colors.HexColor("#E3E5E8")),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    el.append(info_table)
+    el.append(Spacer(1, 14))
+
+    el.append(_seccion_pdf("Trabajos"))
+    el.append(Spacer(1, 4))
+    headers_trab = ["Actividad", "Collera Desde", "Collera Hasta", "Km Desde", "Km Hasta", "Unidad", "Cant.", "N° Trab.", "HH"]
+    anchos_trab = [130, 58, 58, 42, 42, 42, 38, 42, 38]
+    filas_trab = [
+        [t["actividad"], t["collera_desde_id"], t["collera_hasta_id"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hombres"], t["hh"]]
+        for t in resumen["trabajos"]
+    ]
+    el.append(_tabla_pdf(headers_trab, filas_trab, anchos_trab))
     el.append(Spacer(1, 12))
 
-    el.append(Paragraph("Trabajos", styles["Heading2"]))
-    data = [["Actividad", "Collera Desde", "Collera Hasta", "Km Desde", "Km Hasta", "Unidad", "Cant.", "N° Trab.", "HH"]]
-    for t in resumen["trabajos"]:
-        data.append([t["actividad"], t["collera_desde_id"], t["collera_hasta_id"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hombres"], t["hh"]])
-    el.append(_tabla_pdf(data))
-    el.append(Spacer(1, 10))
+    el.append(_seccion_pdf("Equipos"))
+    el.append(Spacer(1, 4))
+    filas_equ = [[e["nombre"], e["cantidad"]] for e in resumen["equipos"]]
+    el.append(_tabla_pdf(["Equipo", "Cantidad"], filas_equ, [PDF_ANCHO_UTIL - 90, 90]))
+    el.append(Spacer(1, 12))
 
-    el.append(Paragraph("Equipos", styles["Heading2"]))
-    data = [["Equipo", "Cantidad"]]
-    for e in resumen["equipos"]:
-        data.append([e["nombre"], e["cantidad"]])
-    el.append(_tabla_pdf(data))
-    el.append(Spacer(1, 10))
+    el.append(_seccion_pdf("Materiales"))
+    el.append(Spacer(1, 4))
+    filas_mat = [[_resolver_nombre(m), m["cantidad"], m.get("estado", "")] for m in resumen["materiales"]]
+    el.append(_tabla_pdf(["Material", "Cantidad", "Estado"], filas_mat, [PDF_ANCHO_UTIL - 190, 80, 110]))
+    el.append(Spacer(1, 12))
 
-    el.append(Paragraph("Materiales", styles["Heading2"]))
-    data = [["Material", "Cantidad", "Estado"]]
-    for m in resumen["materiales"]:
-        data.append([_resolver_nombre(m), m["cantidad"], m.get("estado", "")])
-    el.append(_tabla_pdf(data))
-    el.append(Spacer(1, 10))
+    el.append(_seccion_pdf("Observaciones"))
+    el.append(Spacer(1, 6))
+    el.append(Paragraph(resumen["observaciones"] or "Sin observaciones.", styles["Normal"]))
+    el.append(Spacer(1, 12))
 
-    el.append(Paragraph("Observaciones", styles["Heading2"]))
-    el.append(Paragraph(resumen["observaciones"] or "—", styles["Normal"]))
-    el.append(Spacer(1, 10))
-
-    el.append(Paragraph("Asistencia", styles["Heading2"]))
-    data = [["Trabajador", "Cargo", "Estado"]]
-    for a in resumen["asistencia"]:
-        data.append([a["nombre"], a["cargo"], a["estado"]])
-    el.append(_tabla_pdf(data))
+    el.append(_seccion_pdf("Asistencia"))
+    el.append(Spacer(1, 4))
+    filas_asi = [[a["nombre"], a["cargo"], a["estado"]] for a in resumen["asistencia"]]
+    el.append(_tabla_pdf(["Trabajador", "Cargo", "Estado"], filas_asi, [PDF_ANCHO_UTIL - 220, 130, 90]))
 
     if resumen["fotos"]:
-        el.append(Spacer(1, 10))
-        el.append(Paragraph("Fotografías", styles["Heading2"]))
+        el.append(Spacer(1, 12))
+        el.append(_seccion_pdf("Fotografías"))
+        el.append(Spacer(1, 8))
         for nombre, ruta in resumen["fotos"]:
             try:
                 with PILImage.open(ruta) as im:
@@ -890,7 +977,8 @@ def generar_pdf_reporte(resumen: dict) -> bytes:
             except Exception:
                 el.append(Paragraph(f"(No se pudo incrustar: {nombre})", styles["Normal"]))
 
-    doc.build(el)
+    pie_pagina = lambda c, d: _pie_pagina_pdf(c, d, resumen["reporte_id"])
+    doc.build(el, onFirstPage=pie_pagina, onLaterPages=pie_pagina)
     return buf.getvalue()
 
 def generar_documentos_reporte(resumen: dict):
@@ -2352,6 +2440,7 @@ def page_planificacion():
     st.caption("«Ejecutado» se calcula automáticamente sumando lo registrado en los Reportes Diarios de ese mes.")
 
     ejecutado = ejecutado_por_actividad(anio, mes)
+    meta_anual = meta_anual_por_actividad(df_plan, anio, mes)
     filas_comparacion = []
     for act in ACTIVIDADES_TRABAJO:
         plan_val = float(plan_actual.get(act, 0.0))
@@ -2360,6 +2449,7 @@ def page_planificacion():
         filas_comparacion.append({
             "Actividad": act,
             "Unidad": unidad_actual.get(act) or "—",
+            "Meta Anual": round(float(meta_anual.get(act, 0.0)), 3),
             "Planificado": plan_val,
             "Ejecutado": ejec_val,
             "Avance %": round(avance, 1),
@@ -2377,6 +2467,22 @@ def page_dashboard_durmientes():
     c2.metric("Cumplen", resumen["cumplen"])
     c3.metric("No cumplen", resumen["no_cumplen"])
     c4.metric("% cumplimiento", f"{resumen['pct_cumplimiento']:.0f}%")
+
+    st.divider()
+    st.markdown("#### Distribución de colleras")
+    df_torta = pd.DataFrame({
+        "Estado": ["Cumple", "No Cumple", "Sin Inspeccionar"],
+        "Colleras": [resumen["cumplen"], resumen["no_cumplen"], resumen["sin_datos"]],
+    })
+    grafico_torta = alt.Chart(df_torta).mark_arc(innerRadius=60).encode(
+        theta=alt.Theta("Colleras:Q"),
+        color=alt.Color("Estado:N", scale=alt.Scale(
+            domain=["Cumple", "No Cumple", "Sin Inspeccionar"],
+            range=["#2FA84F", "#DC3545", "#B0B5BB"],
+        ), legend=alt.Legend(title=None)),
+        tooltip=["Estado:N", "Colleras:Q"],
+    ).properties(height=260)
+    st.altair_chart(grafico_torta, width="stretch")
 
     st.divider()
     st.markdown("#### Mapa de condición por PK")

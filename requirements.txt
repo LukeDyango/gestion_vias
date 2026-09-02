@@ -7,3 +7,4 @@ reportlab==5.0.0
 gspread==6.2.1
 google-auth==2.56.3
 streamlit-geolocation==0.0.10
+altair==6.0.0
