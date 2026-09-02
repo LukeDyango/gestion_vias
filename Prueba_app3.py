@@ -584,7 +584,11 @@ def _agregar_filas(nombre_hoja: str, filas: list):
         try:
             ws = _hoja_sheets(sh, nombre_hoja)
             filas_texto = [[("" if v is None else v) for v in fila] for fila in filas]
-            ws.append_rows(filas_texto, value_input_option="USER_ENTERED")
+            # RAW (no USER_ENTERED): USER_ENTERED hace que el propio Sheet reinterprete los
+            # números según la configuración regional de la hoja -- con locale chileno (coma
+            # decimal, punto como separador de miles) "430.56" se leía como "43.056" y quedaba
+            # guardado como 43056. RAW escribe el valor literal, sin reinterpretación.
+            ws.append_rows(filas_texto, value_input_option="RAW")
         except Exception:
             pass  # si falla Sheets, el reporte igual quedó guardado en el Excel local
 
@@ -619,7 +623,11 @@ def _sincronizar_tabla_sheets(nombre_hoja: str, filas: list):
         ws.append_row(headers)
         if filas:
             filas_texto = [[("" if v is None else v) for v in fila] for fila in filas]
-            ws.append_rows(filas_texto, value_input_option="USER_ENTERED")
+            # RAW (no USER_ENTERED): USER_ENTERED hace que el propio Sheet reinterprete los
+            # números según la configuración regional de la hoja -- con locale chileno (coma
+            # decimal, punto como separador de miles) "430.56" se leía como "43.056" y quedaba
+            # guardado como 43056. RAW escribe el valor literal, sin reinterpretación.
+            ws.append_rows(filas_texto, value_input_option="RAW")
     except Exception:
         pass  # si falla Sheets, los datos igual quedaron guardados localmente
 
