@@ -100,6 +100,17 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
     font-weight: 600; font-size: 12px; box-shadow: none !important; padding: 6px 2px !important;
 }
 .nav-brand { text-align: center; color: #b6bcc4; font-size: 11px; letter-spacing: 1px; padding-top: 2px; }
+
+/* ---- Pie "Desarrollado por" ---- */
+.pie-dev { margin: 22px 0 10px 0; padding: 14px 16px; border-radius: 12px; text-align: center;
+    background: linear-gradient(135deg, #0B3B8A 0%, #3D7DD9 100%); color: #fff; }
+.pie-dev .pie-dev-nombre { font-weight: 700; font-size: 13px; }
+.pie-dev .pie-dev-contacto { font-size: 11.5px; opacity: .9; margin-top: 2px; }
+.pie-dev .pie-dev-contacto a { color: #fff; text-decoration: underline; }
+.st-key-btn_footer_whatsapp button {
+    background: #25D366 !important; color: #fff !important; border: none !important;
+    font-weight: 700 !important; margin-top: 8px !important;
+}
 </style>
 """
 st.markdown(MOBILE_CSS, unsafe_allow_html=True)
@@ -1301,6 +1312,24 @@ def perfil_bar():
             st.session_state.page = "Inicio"
             st.rerun()
 
+def render_pie_desarrollador():
+    st.markdown(
+        """
+        <div class="pie-dev">
+            <div class="pie-dev-nombre">👨‍💻 Desarrollado por Lukas Dyango Sanhueza Canales</div>
+            <div class="pie-dev-contacto">
+                <a href="mailto:lukassanhueza2000@gmail.com">lukassanhueza2000@gmail.com</a> · +56 9 2722 1163
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.link_button(
+        "💬 Contactar por WhatsApp",
+        "https://wa.me/56927221163",
+        key="btn_footer_whatsapp", width="stretch",
+    )
+
 def bottom_nav(items):
     active_slug = _slug(st.session_state.page)
     st.markdown(
@@ -2096,6 +2125,7 @@ def flujo_terreno():
     else:
         st.session_state.page = "Inicio"
         st.rerun()
+    render_pie_desarrollador()
     bottom_nav([("Inicio", "🏠"), ("Crear Incidencia", "➕"), ("Generar Reporte", "📝"), ("Mis Avisos", "📋")])
 
 # =========================================================
@@ -2543,6 +2573,7 @@ def flujo_validador():
     else:
         st.session_state.page = "Inicio"
         st.rerun()
+    render_pie_desarrollador()
     bottom_nav([("Inicio", "🏠"), ("Crear Aviso", "➕"), ("Backlog", "📋"), ("OTs", "🔧")])
 
 # -------------------------
