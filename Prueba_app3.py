@@ -15,7 +15,7 @@ import gspread
 from google.oauth2.service_account import Credentials as GoogleCredentials
 from streamlit_geolocation import streamlit_geolocation
 import altair as alt
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.units import cm
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -1006,11 +1006,10 @@ def generar_documentos_reporte(resumen: dict):
         pdf_bytes = generar_pdf_reporte({**resumen, "fotos": []})
     return excel_bytes, pdf_bytes
 
-def generar_respaldo_plano() -> bytes | None:
-    """Resumen legible de TODO el histórico (todas las actividades de todos los Reportes Diarios
-    guardados hasta ahora): una fila por actividad, con Equipo/Materiales/Fotos-Observación/
-    Asistencia condensados cada uno en una sola celda. El libro maestro (reportes_diarios.xlsx)
-    sigue normalizado en hojas separadas para Power BI; esto es solo una vista aparte para leer rápido."""
+def _filas_respaldo_plano() -> list:
+    """Arma las filas planas del histórico completo (una fila por actividad, con Equipo/
+    Materiales/Fotos-Observación/Asistencia condensados cada uno en una sola celda) --
+    compartido entre el Excel y el PDF de respaldo, para no duplicar la lógica."""
     df_rep = _leer_hoja_df("Reportes")
     df_trab = _leer_hoja_df("Trabajos")
     df_equ = _leer_hoja_df("Equipos")
@@ -1018,13 +1017,9 @@ def generar_respaldo_plano() -> bytes | None:
     df_asi = _leer_hoja_df("Asistencia")
     df_fot = _leer_hoja_df("Fotos")
     if df_rep.empty:
-        return None
+        return []
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Resumen"
-    ws.append(FLAT_HEADERS)
-
+    filas = []
     for _, rep in df_rep.iterrows():
         rid = rep["ReporteID"]
         trabajos_rep = df_trab[df_trab["ReporteID"] == rid]
@@ -1054,16 +1049,73 @@ def generar_respaldo_plano() -> bytes | None:
         ubicacion_txt = ubicacion if isinstance(ubicacion, str) and ubicacion.strip() else "—"
 
         for _, t in trabajos_rep.iterrows():
-            ws.append([
+            filas.append([
                 rep["GrupoVia"], rep["Usuario"], rep["Fecha"], ubicacion_txt,
                 t["Actividad"], t.get("ColleraDesdeID", ""), t.get("ColleraHastaID", ""), t["KmDesde"], t["KmHasta"], t["Unidad"], t["Cantidad"], t["HH"],
                 equipo_txt, material_txt, fotos_obs_txt, asistencia_txt,
             ])
+    return filas
 
+def generar_respaldo_plano() -> bytes | None:
+    """Resumen legible de TODO el histórico en Excel. El libro maestro (reportes_diarios.xlsx)
+    sigue normalizado en hojas separadas para Power BI; esto es solo una vista aparte para leer rápido."""
+    filas = _filas_respaldo_plano()
+    if not filas:
+        return None
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Resumen"
+    ws.append(FLAT_HEADERS)
+    for fila in filas:
+        ws.append(fila)
     _ajustar_anchos_columnas(ws, FLAT_COL_WIDTHS)
 
     buf = io.BytesIO()
     wb.save(buf)
+    return buf.getvalue()
+
+def generar_respaldo_pdf() -> bytes | None:
+    """Misma información que generar_respaldo_plano() pero en PDF (apaisado, para que
+    quepan las 16 columnas) -- entrega solicitada además del Excel."""
+    filas = _filas_respaldo_plano()
+    if not filas:
+        return None
+
+    ancho_pagina = landscape(A4)
+    ancho_util = ancho_pagina[0] - 2.4 * cm
+    anchos = [32, 50, 42, 50, 72, 38, 38, 32, 32, 28, 28, 28, 58, 58, 58, 58]  # suma ~704, cabe en ~704pt
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=ancho_pagina, topMargin=1.2 * cm, bottomMargin=1.6 * cm,
+                             leftMargin=1.2 * cm, rightMargin=1.2 * cm)
+
+    estilo_banner = ParagraphStyle("banner_resp", fontName="Helvetica-Bold", fontSize=13, textColor=colors.white)
+    banner = Table([[Paragraph("RESPALDO HISTÓRICO — REPORTES DIARIOS", estilo_banner)]], colWidths=[ancho_util])
+    banner.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#0B3B8A")),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+    ]))
+    estilo_sub = ParagraphStyle("sub_resp", fontName="Helvetica", fontSize=8, textColor=colors.HexColor("#6c757d"))
+    el = [
+        banner,
+        Spacer(1, 8),
+        Paragraph(f"{len(filas)} actividades registradas · Generado {datetime.now().strftime('%d-%m-%Y %H:%M')}", estilo_sub),
+        Spacer(1, 10),
+        _tabla_pdf(FLAT_HEADERS, filas, anchos),
+    ]
+
+    def _pie(c, d):
+        c.saveState()
+        c.setFont("Helvetica", 7)
+        c.setFillColor(colors.HexColor("#8A8F98"))
+        c.drawString(1.2 * cm, 0.9 * cm, f"Respaldo histórico · Generado {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+        c.drawRightString(ancho_pagina[0] - 1.2 * cm, 0.9 * cm, f"Página {d.page}")
+        c.restoreState()
+
+    doc.build(el, onFirstPage=_pie, onLaterPages=_pie)
     return buf.getvalue()
 
 def mostrar_detalle_reporte_diario(reporte_id: str):
@@ -2154,18 +2206,34 @@ def validador_inicio():
     if st.button("🛤️  Durmientes (Norma NS-01-01-00)", key="btn_durmientes"):
         st.session_state.page = "Durmientes"
         st.rerun()
+    if st.button("🗂️  Control de Colleras (administración)", key="btn_control_colleras"):
+        st.session_state.page = "Control Colleras"
+        st.rerun()
     if st.button("📊  Reportes (Demo)", key="btn_reportes"):
         st.info("Próximamente: dashboard de KPIs.")
 
+    st.markdown("##### Descargar histórico completo")
+    col_excel, col_pdf = st.columns(2)
     respaldo_bytes = generar_respaldo_plano()
-    if respaldo_bytes:
-        st.download_button(
-            "💾  Descargar respaldo de Reportes Diarios",
-            data=respaldo_bytes,
-            file_name="reportes_diarios_respaldo.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="btn_backup_reportes", width="stretch",
-        )
+    with col_excel:
+        if respaldo_bytes:
+            st.download_button(
+                "💾  Excel",
+                data=respaldo_bytes,
+                file_name="reportes_diarios_respaldo.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="btn_backup_reportes", width="stretch",
+            )
+    with col_pdf:
+        respaldo_pdf_bytes = generar_respaldo_pdf()
+        if respaldo_pdf_bytes:
+            st.download_button(
+                "📄  PDF",
+                data=respaldo_pdf_bytes,
+                file_name="reportes_diarios_respaldo.pdf",
+                mime="application/pdf",
+                key="btn_backup_reportes_pdf", width="stretch",
+            )
 
     with st.expander("⚙️ Avanzado"):
         st.caption(
@@ -2515,44 +2583,131 @@ def page_dashboard_durmientes():
     st.altair_chart(grafico_torta, width="stretch")
 
     st.divider()
+    if st.button("🗂️ Ver / editar colleras por PK", key="btn_ir_control_colleras", width="stretch"):
+        st.session_state.page = "Control Colleras"
+        st.rerun()
+
+    st.divider()
     st.markdown("#### Mapa de condición por PK")
+    st.caption("Toca un PK para ir directo a sus colleras en Control de Colleras.")
     color = {"Bueno": "#2FA84F", "Regular": "#E0A458", "Malo": "#DC3545", "Sin Datos": "#B0B5BB"}
     filas = resumen_por_pk()
+    css_mapa_pk = "".join(
+        f".st-key-mapa_pk_{f['PK']} button {{ background:{color[f['Estado KM']]} !important; "
+        f"color:#fff !important; border:none !important; padding:4px 0 !important; "
+        f"font-size:11px !important; font-weight:700 !important; }}\n"
+        for f in filas
+    )
+    st.markdown(f"<style>{css_mapa_pk}</style>", unsafe_allow_html=True)
     cols = st.columns(len(filas))
     for col, f in zip(cols, filas):
         with col:
-            estado_km = f["Estado KM"]
-            st.markdown(
-                f"<div style='background:{color[estado_km]};height:40px;border-radius:6px;"
-                f"text-align:center;color:#fff;font-size:11px;padding-top:4px;' title='{estado_km}'>{f['PK']}</div>",
-                unsafe_allow_html=True)
+            if st.button(str(f["PK"]), key=f"mapa_pk_{f['PK']}", help=f"PK {f['PK']} · {f['Estado KM']}"):
+                st.session_state.control_col_pk = f["PK"]
+                st.session_state.page = "Control Colleras"
+                st.rerun()
 
     st.divider()
     st.markdown("#### Detalle por PK")
     st.dataframe(pd.DataFrame(filas), hide_index=True, width="stretch")
 
+def page_control_colleras():
+    """Pantalla de administración: edita el estado de durmientes de cualquier collera
+    directamente (sin pasar por un Reporte Diario). Separada a propósito del flujo de
+    terreno -- el Reporte Diario sigue registrando una collera puntual, ligada a su
+    ReporteID, para mantener esa trazabilidad. Los cambios de acá quedan en el mismo
+    historial (durmientes_estado), solo que con un 'ReporteID' de ajuste manual."""
+    app_header("Control de Colleras", back_page="Durmientes")
+    perfil_bar()
+    st.caption("Edición directa del estado de durmientes por collera. Los cambios quedan en el historial igual que los reportados en terreno.")
+
+    df_colleras = cargar_todas_colleras()
+    if df_colleras.empty:
+        st.info("El catálogo de colleras está vacío.")
+        return
+    pks_disponibles = sorted(int(p) for p in df_colleras["PK"].unique())
+    pk_default = st.session_state.get("control_col_pk", pks_disponibles[0])
+    if pk_default not in pks_disponibles:
+        pk_default = pks_disponibles[0]
+    if "control_col_pk" not in st.session_state:
+        st.session_state.control_col_pk = pk_default
+    pk_sel = st.selectbox("PK", pks_disponibles, key="control_col_pk")
+
+    colleras_pk = df_colleras[df_colleras["PK"] == pk_sel].sort_values("Collera")
+    df_vigente = _estado_vigente(st.session_state.durmientes_estado)
+
+    opciones_estado = ["", "Bueno", "Malo", "Nuevo", "Reemplazado"]
+    filas_editor = []
+    for _, c in colleras_pk.iterrows():
+        collera_id = c["ColleraID"]
+        estados = {}
+        if not df_vigente.empty:
+            filas_c = df_vigente[df_vigente["ColleraID"] == collera_id]
+            estados = {int(r["Posicion"]): r["Estado"] for _, r in filas_c.iterrows()}
+        fila = {"Collera": collera_id, "N°": int(c["Collera"]), "Ubicación": c["Ubicacion"]}
+        for pos in range(1, 24):
+            fila[f"D{pos}"] = estados.get(pos, "")
+        filas_editor.append(fila)
+
+    column_config = {
+        "Collera": st.column_config.TextColumn(disabled=True, width="small"),
+        "N°": st.column_config.NumberColumn(disabled=True, width="small"),
+        "Ubicación": st.column_config.TextColumn(disabled=True, width="small"),
+    }
+    for pos in range(1, 24):
+        column_config[f"D{pos}"] = st.column_config.SelectboxColumn(options=opciones_estado, width="small")
+
+    st.caption(f"{len(filas_editor)} colleras en el PK {pk_sel}. Deja en blanco lo no inspeccionado.")
+    df_editado = st.data_editor(
+        pd.DataFrame(filas_editor), hide_index=True, width="stretch",
+        key=f"control_colleras_editor_{pk_sel}", column_config=column_config,
+    )
+
+    if st.button("💾 Guardar cambios de este PK", key="btn_guardar_control_colleras", width="stretch"):
+        fecha_str = datetime.now().strftime("%Y-%m-%d")
+        reporte_ajuste = f"AJUSTE-MANUAL-{st.session_state.usuario}"
+        filas_nuevas = []
+        for _, fila in df_editado.iterrows():
+            collera_id = fila["Collera"]
+            for pos in range(1, 24):
+                estado_nuevo = fila.get(f"D{pos}") or ""
+                if not estado_nuevo:
+                    continue
+                if not df_vigente.empty:
+                    anterior = df_vigente[(df_vigente["ColleraID"] == collera_id) & (df_vigente["Posicion"] == pos)]
+                else:
+                    anterior = df_vigente
+                estado_previo = anterior.iloc[0]["Estado"] if not anterior.empty else None
+                if estado_nuevo == estado_previo:
+                    continue
+                filas_nuevas.append({
+                    "ColleraID": collera_id, "Posicion": pos, "Estado": estado_nuevo,
+                    "FechaActualizacion": fecha_str, "ReporteID": reporte_ajuste,
+                })
+        if filas_nuevas:
+            st.session_state.durmientes_estado = pd.concat(
+                [st.session_state.durmientes_estado, pd.DataFrame(filas_nuevas)], ignore_index=True)
+            save_all_durmientes_estado()
+            st.success(f"{len(filas_nuevas)} cambio(s) guardado(s) ✅")
+            st.rerun()
+        else:
+            st.info("No hay cambios nuevos que guardar.")
+
     st.divider()
-    st.markdown("#### Buscar una collera")
-    pk_buscar = st.number_input("PK", min_value=33, max_value=61, step=1, key="durm_dash_pk")
-    colleras_pk = cargar_colleras_de_pk(pk_buscar)
-    if colleras_pk:
-        opciones = [f"Collera {c['Collera']} ({c['ColleraID']})" for c in colleras_pk]
-        seleccion = st.selectbox("Collera", opciones, key="durm_dash_collera")
-        idx = opciones.index(seleccion)
-        c = colleras_pk[idx]
-        df_colleras = cargar_todas_colleras()
-        ubicacion = df_colleras[df_colleras["ColleraID"] == c["ColleraID"]]["Ubicacion"].iloc[0]
-        ev = evaluar_collera(c["ColleraID"], ubicacion)
-        badge_kind = {"Cumple": "ok", "No Cumple": "bad", "Sin Inspeccionar": "muted"}.get(ev["estado_general"], "info")
-        badge(ev["estado_general"], badge_kind)
-        st.write(f"**{c['ColleraID']}** · {ubicacion} · km {c['KmDesde']:.3f}–{c['KmHasta']:.3f}")
-        cc1, cc2, cc3, cc4 = st.columns(4)
-        cc1.metric("Efectivos", ev["efectivos"])
-        cc2.metric("Malos", ev["n_malos"])
-        cc3.metric("Racha máx. Malo", ev["racha_max"])
-        cc4.metric("% renovación", f"{ev['pct_renovacion'] * 100:.0f}%")
-    else:
-        st.info("No hay colleras registradas para este PK.")
+    st.markdown("#### Resumen del PK")
+    df_vigente_actualizado = _estado_vigente(st.session_state.durmientes_estado)
+    filas_resumen = []
+    for _, c in colleras_pk.iterrows():
+        ev = evaluar_collera(c["ColleraID"], c["Ubicacion"], df_vigente_actualizado)
+        filas_resumen.append({
+            "Collera": c["ColleraID"], "Ubicación": c["Ubicacion"],
+            "Registrado": ev["total_registrado"], "Buenos": ev["n_buenos"], "Malos": ev["n_malos"],
+            "Nuevos": ev["n_nuevos"], "Reemplazados": ev["n_reempl"], "Efectivos": ev["efectivos"],
+            "% Renovación": round(ev["pct_renovacion"] * 100, 1), "Racha Máx. Malo": ev["racha_max"],
+            "Mínimo Efectivo": "Sí" if ev["efectivos"] >= 10 else "No",
+            "Estado General": ev["estado_general"],
+        })
+    st.dataframe(pd.DataFrame(filas_resumen), hide_index=True, width="stretch")
 
 def flujo_validador():
     page = st.session_state.page
@@ -2570,6 +2725,8 @@ def flujo_validador():
         page_planificacion()
     elif page == "Durmientes":
         page_dashboard_durmientes()
+    elif page == "Control Colleras":
+        page_control_colleras()
     else:
         st.session_state.page = "Inicio"
         st.rerun()
