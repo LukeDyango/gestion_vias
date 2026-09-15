@@ -2475,6 +2475,17 @@ def es_hoja(nodo_id):
     return fila["c"] == 0
 
 
+def es_obra(nodo):
+    """¿Es el nodo de obra individual (Nivel 3), el que agrupa Actividades?
+
+    Se reconoce por el código, con la misma regla que usan nodos_obra()
+    y ubicacion_de_ruta(): los de obra llevan punto —EST.TAL,
+    T2-E-VC.PLA— y los de tipo o tramo no. Es el nivel donde vive el
+    apartado de "Reportar actividad fuera del programa".
+    """
+    return "." in (nodo.get("codigo") or "")
+
+
 # Niveles que la BD de actividades llama «Actividad». La rama demo usa
 # «especialidad» y la importada, «actividad»: para el reporte son lo mismo.
 TIPOS_ACTIVIDAD = ("actividad", "especialidad")
@@ -3598,26 +3609,14 @@ def ir(paso):
 
 
 def es_reportable(nodo):
-    """Permite reportar Steps del programa y el Step virtual excepcional."""
-    return (nodo.get("tipo") or "") in ("step", "step_fuera_programa")
+    """¿Sobre este nodo se puede hacer un reporte?
 
+    Solo los Step. Una obra a la que aún no se le cargó el programa
+    también se queda sin hijos, y dejar que se reporte sobre ella
+    produciría un reporte sin actividad ni ID contra el cual cruzarlo.
+    """
+    return (nodo.get("tipo") or "") == "step"
 
-def es_nodo_obra(nodo):
-    return bool(nodo and "." in (nodo.get("codigo") or ""))
-
-
-def abrir_reporte_fuera_programa(obra):
-    """Abre el formulario existente con IDs propios, ajenos al programa."""
-    token = uuid.uuid4().hex[:12].upper()
-    virtual = {"id": f"{obra['id']}/fuera-programa-{token.lower()}",
-               "nombre": "Actividad fuera del programa", "padre_id": obra["id"],
-               "tipo": "step_fuera_programa", "codigo": f"FPROG-STP-{token}",
-               "unidad": "und", "pregunta": "",
-               "id_actividad": f"FPROG-ACT-{token}", "id_step": f"FPROG-STP-{token}",
-               "hh_lb": None, "cantidad_lb": None, "latitud": None, "longitud": None}
-    st.session_state.ruta.append(virtual)
-    st.session_state.paso = "formulario"
-    st.rerun()
 
 def bajar(nodo):
     """Entra un nivel. Si el nodo es un Step, abre el formulario."""
@@ -3625,6 +3624,47 @@ def bajar(nodo):
     st.session_state.paso = ("formulario"
                              if es_hoja(nodo["id"]) and es_reportable(nodo)
                              else "arbol")
+    st.rerun()
+
+
+def nuevo_id_fuera_programa():
+    """Código que no coincide con ningún ID ACT ni COD STEP del programa.
+
+    Prefijo FP + sufijo al azar, nunca un correlativo: así no hay forma
+    de que choque con un código real del catálogo, ni ahora ni cuando
+    Planificación publique una revisión nueva.
+    """
+    return "FP-" + uuid.uuid4().hex[:6].upper()
+
+
+def bajar_fuera_programa(obra):
+    """Entra al reporte de una actividad no contemplada en el programa.
+
+    No hay Actividad ni Step que elegir —por eso se salta directo al
+    formulario—: se genera un ID ACT y un COD STEP propios, fuera de
+    cualquier catálogo, y el supervisor describe ahí qué se ejecutó
+    (ver pantalla_formulario). El ID ACT se conserva mientras no se
+    vuelva a tocar este botón, así que "Otro reporte en el mismo Step"
+    desde la pantalla de guardado encadena varios reportes bajo la
+    misma actividad fuera de programa.
+    """
+    ss = st.session_state
+    id_act = nuevo_id_fuera_programa()
+    actividad_fp = {
+        "id": f"{obra['id']}::fp::{id_act}", "nombre": "Fuera de programa",
+        "tipo": "actividad", "codigo": id_act, "id_actividad": id_act,
+        "padre_id": obra["id"],
+    }
+    step_fp = {
+        "id": f"{actividad_fp['id']}::step", "nombre": "Actividad fuera de programa",
+        "tipo": "step", "codigo": nuevo_id_fuera_programa(),
+        "unidad": "und", "padre_id": actividad_fp["id"],
+        "fuera_de_programa": True,
+    }
+    step_fp["id_step"] = step_fp["codigo"]
+    ss.ruta.append(actividad_fp)
+    ss.ruta.append(step_fp)
+    ss.paso = "formulario"
     st.rerun()
 
 
@@ -3638,7 +3678,13 @@ def es_nivel_de_paso(ruta, auth):
 
     Un nivel así no es una decisión: la app lo cruza sola en vez de
     pedir un toque para el único botón que hay.
+
+    La obra es la excepción: aunque tenga una sola Actividad cargada,
+    ahí vive el apartado para reportar algo fuera del programa, así
+    que ese nivel nunca se salta ni al bajar ni al volver.
     """
+    if ruta and es_obra(ruta[-1]):
+        return False
     opciones = opciones_de_nivel(ruta, auth)
     return len(opciones) == 1 and not es_hoja(opciones[0]["id"])
 
@@ -4433,7 +4479,7 @@ def pantalla_arbol():
     # que hace que un supervisor de un solo frente entre directo a sus
     # actividades.
     if (len(opciones) == 1 and not es_hoja(opciones[0]["id"])
-            and not (ruta and es_nodo_obra(ruta[-1]))):
+            and not (ruta and es_obra(ruta[-1]))):
         bajar(opciones[0])
         return
 
@@ -4444,16 +4490,14 @@ def pantalla_arbol():
     breadcrumb()
     buscador_por_id(auth)
 
-    if ruta and es_nodo_obra(ruta[-1]):
-        if st.button("📝  Reportar actividades fuera del programa", key=clave_widget("step_fuera", ruta[-1]["id"]), width="stretch"):
-            abrir_reporte_fuera_programa(ruta[-1])
-
     if not opciones:
         if permisos_de(auth) is not None and not ruta:
             st.warning("No tiene actividades asignadas. Pida a Oficina Técnica que le "
                        "asigne obras o actividades desde 👥 Asignar.")
         else:
             st.info("Este nivel no tiene actividades cargadas.")
+        if ruta and es_obra(ruta[-1]):
+            apartado_fuera_de_programa(ruta[-1])
         bottom_nav()
         return
 
@@ -4503,7 +4547,26 @@ def pantalla_arbol():
         if st.button(etiqueta, key=clave, width="stretch"):
             bajar(o)
 
+    if ruta and es_obra(ruta[-1]):
+        apartado_fuera_de_programa(ruta[-1])
+
     bottom_nav()
+
+
+def apartado_fuera_de_programa(obra):
+    """El botón para reportar algo que no está en el programa de la obra.
+
+    Va aparte de la lista de Actividades —con su propio divisor— porque
+    no es una Actividad más del catálogo: no tiene ID ni Step previstos,
+    se generan al tocarlo (ver bajar_fuera_programa()).
+    """
+    st.divider()
+    st.markdown(
+        '<p class="hint">¿Se ejecutó algo que no está en el programa de esta obra?</p>',
+        unsafe_allow_html=True)
+    if st.button("🆓  Reportar actividad fuera del programa",
+                  key=clave_widget("fp", obra["id"]), width="stretch"):
+        bajar_fuera_programa(obra)
 
 
 def pantalla_formulario():
@@ -4530,7 +4593,13 @@ def pantalla_formulario():
         limpiar_formulario()
         ss["f_step_id"] = step["id"]
 
-    app_header("Reporte Diario", step["nombre"])
+    # Actividad fuera de programa: el ID ACT y el COD STEP ya se
+    # generaron al tocar el botón (bajar_fuera_programa()); no vienen
+    # de ningún catálogo, así que el nombre a mostrar se pide más abajo.
+    fuera_de_programa = bool(step.get("fuera_de_programa"))
+
+    app_header("Reporte Diario",
+               "Actividad fuera de programa" if fuera_de_programa else step["nombre"])
 
     # Campos que la planilla y SharePoint quieren como columnas propias:
     # la rama raíz, y dónde se ejecutó según los códigos de la ruta.
@@ -4544,12 +4613,21 @@ def pantalla_formulario():
     # supervisor no tiene por qué conocerlos— pero sí se muestran como
     # referencia para que se pueda auditar contra el programa.
     ids = resolver_ids(ruta)
-    fuera_programa = step.get("tipo") == "step_fuera_programa"
-    if fuera_programa:
-        nombre_fuera = st.text_input("Nombre de la actividad fuera del programa", key="f_actividad_fuera", placeholder="Describa la actividad ejecutada").strip()
-        ids["actividad"] = nombre_fuera
-    else:
-        nombre_fuera = ""
+
+    # Lo único que falta de la actividad fuera de programa: que el
+    # supervisor diga qué se ejecutó, porque no viene de ningún
+    # catálogo que lo diga por él.
+    descripcion_fp = ""
+    if fuera_de_programa:
+        st.markdown(
+            '<p class="hint">⚠️ Actividad fuera del programa: el ID ACT y el COD '
+            'STEP se generaron solo para este reporte y no están en el catálogo. '
+            'Describa qué se ejecutó.</p>', unsafe_allow_html=True)
+        descripcion_fp = st.text_input(
+            "Actividad ejecutada", key="f_desc_fp",
+            placeholder="Ej. Reparación de cerco perimetral dañado por temporal"
+        ).strip()
+    nombre_actividad = descripcion_fp or step["nombre"]
 
     # Coordenadas de la obra más cercana en la ruta (vienen de la planilla).
     # OJO con el nombre: `ubicacion` es el diccionario de arriba, y se usa
@@ -4564,7 +4642,6 @@ def pantalla_formulario():
     fecha = date.today()
     horas = horas_por_fecha(fecha)
 
-    nombre_reportado = nombre_fuera or step["nombre"]
     codigos = " · ".join(t for t in (
         f'ACT {ids["id_actividad"]}' if ids["id_actividad"] else "",
         f'STEP {ids["id_step"]}' if ids["id_step"] else "") if t)
@@ -4577,7 +4654,7 @@ def pantalla_formulario():
 
     st.markdown(
         f'<div class="ctx-card">'
-        f'<div class="step">📄 {nombre_reportado}</div>'
+        f'<div class="step">📄 {nombre_actividad}</div>'
         f'<div class="ruta">{ruta_texto(ruta)}</div>'
         f'<div class="meta">👷 {ss.supervisor or auth["nombre"]} · 🏢 {auth["empresa"]}'
         f'{coords_texto}</div>'
@@ -4799,7 +4876,7 @@ def pantalla_formulario():
         "pie": f"{nombre_obra or obra} · {auth['empresa']}",
     }
     fotos_listas = preparar_fotos(foto_camara, fotos_archivo, estampar,
-                                  nombre_reportado, lineas_sello(datos_sello))
+                                  nombre_actividad, lineas_sello(datos_sello))
     if fotos_listas:
         st.image(fotos_listas[0][1], width="stretch",
                  caption=f"Así se guardará la evidencia ({len(fotos_listas)} foto/s)")
@@ -4813,14 +4890,14 @@ def pantalla_formulario():
 
     if guardar:
         errores = []
-        if fuera_programa and not nombre_fuera:
-            errores.append("Indique el nombre de la actividad fuera del programa.")
         if not firma_ok:
             errores.append("Debe firmar la declaración para guardar el reporte.")
         if not firma_nombre.strip():
             errores.append("Indique el nombre de quien firma.")
         if hubo_incidencia and not incidencias.strip():
             errores.append("Marcó que hubo incidencia: describa el detalle.")
+        if fuera_de_programa and not descripcion_fp:
+            errores.append("Describa qué actividad fuera del programa se ejecutó.")
         if errores:
             for e in errores:
                 st.error(e)
@@ -4848,8 +4925,8 @@ def pantalla_formulario():
                   ?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?, 0)""", (
             reporte_id, datetime.now().strftime("%d-%m-%Y %H:%M"),
             auth["usuario"], auth["empresa"], auth["perfil"], ss.supervisor,
-            step["id"], nombre_reportado, json.dumps([n["id"] for n in ruta]),
-            " › ".join([n["nombre"] for n in ruta[:-1]] + [nombre_reportado]), obra, especialidad,
+            step["id"], nombre_actividad, json.dumps([n["id"] for n in ruta]),
+            ruta_texto(ruta), obra, especialidad,
             # Enganche con el programa: la HH calculada se recalcula
             # aquí para que sea la de los valores efectivamente guardados.
             ids["actividad"], ids["id_actividad"], ids["id_step"],
@@ -4979,7 +5056,13 @@ def pantalla_guardado():
         ir("formulario")
     if st.button("⬅️ Volver al nivel anterior", key="btn_nivel", width="stretch"):
         if ss.ruta:
-            ss.ruta.pop()
+            # Fuera de programa son dos nodos generados (Actividad y
+            # Step) que no existen en el árbol: subir un solo nivel
+            # dejaría parado en la Actividad fantasma, sin nada que
+            # mostrar. Se sube directo a la obra real.
+            extra = ss.ruta.pop()
+            if extra.get("fuera_de_programa") and ss.ruta:
+                ss.ruta.pop()
         ir("arbol")
     if st.button("🏗️ Empezar desde la obra", key="btn_inicio", width="stretch"):
         ss.ruta = []
