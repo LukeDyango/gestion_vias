@@ -3637,23 +3637,23 @@ def nuevo_id_fuera_programa():
     return "FP-" + uuid.uuid4().hex[:6].upper()
 
 
-def bajar_fuera_programa(obra):
+def bajar_fuera_programa(nodo):
     """Entra al reporte de una actividad no contemplada en el programa.
 
     No hay Actividad ni Step que elegir —por eso se salta directo al
     formulario—: se genera un ID ACT y un COD STEP propios, fuera de
     cualquier catálogo, y el supervisor describe ahí qué se ejecutó
-    (ver pantalla_formulario). El ID ACT se conserva mientras no se
-    vuelva a tocar este botón, así que "Otro reporte en el mismo Step"
-    desde la pantalla de guardado encadena varios reportes bajo la
-    misma actividad fuera de programa.
+    (ver pantalla_formulario). Cuelga del nodo donde se tocó el botón,
+    así que la ubicación del reporte es la del punto del árbol en que
+    estaba parado: si fue sobre el tipo de obra y no sobre la obra
+    individual, el reporte sale sin COD OBRA.
     """
     ss = st.session_state
     id_act = nuevo_id_fuera_programa()
     actividad_fp = {
-        "id": f"{obra['id']}::fp::{id_act}", "nombre": "Fuera de programa",
+        "id": f"{nodo['id']}::fp::{id_act}", "nombre": "Fuera de programa",
         "tipo": "actividad", "codigo": id_act, "id_actividad": id_act,
-        "padre_id": obra["id"],
+        "padre_id": nodo["id"],
     }
     step_fp = {
         "id": f"{actividad_fp['id']}::step", "nombre": "Actividad fuera de programa",
@@ -4490,14 +4490,19 @@ def pantalla_arbol():
     breadcrumb()
     buscador_por_id(auth)
 
+    # Va arriba, junto al buscador: si queda al final de la lista hay que
+    # bajar por seis partidas —o trece Steps— para descubrir que existe.
+    # Se ofrece en todo nivel dentro de una obra raíz, no solo en la obra
+    # individual: lo que no está en el programa aparece a cualquier altura.
+    if ruta:
+        apartado_fuera_de_programa(ruta[-1])
+
     if not opciones:
         if permisos_de(auth) is not None and not ruta:
             st.warning("No tiene actividades asignadas. Pida a Oficina Técnica que le "
                        "asigne obras o actividades desde 👥 Asignar.")
         else:
             st.info("Este nivel no tiene actividades cargadas.")
-        if ruta and es_obra(ruta[-1]):
-            apartado_fuera_de_programa(ruta[-1])
         bottom_nav()
         return
 
@@ -4547,26 +4552,24 @@ def pantalla_arbol():
         if st.button(etiqueta, key=clave, width="stretch"):
             bajar(o)
 
-    if ruta and es_obra(ruta[-1]):
-        apartado_fuera_de_programa(ruta[-1])
-
     bottom_nav()
 
 
-def apartado_fuera_de_programa(obra):
-    """El botón para reportar algo que no está en el programa de la obra.
+def apartado_fuera_de_programa(nodo):
+    """El botón para reportar algo que no está en el programa.
 
-    Va aparte de la lista de Actividades —con su propio divisor— porque
-    no es una Actividad más del catálogo: no tiene ID ni Step previstos,
-    se generan al tocarlo (ver bajar_fuera_programa()).
+    Va arriba de la lista, con su propio divisor: no es una opción más
+    del catálogo —no tiene ID ni Step previstos, se generan al tocarlo
+    (ver bajar_fuera_programa())— y al final de la lista no se
+    encuentra.
     """
-    st.divider()
-    st.markdown(
-        '<p class="hint">¿Se ejecutó algo que no está en el programa de esta obra?</p>',
-        unsafe_allow_html=True)
     if st.button("🆓  Reportar actividad fuera del programa",
-                  key=clave_widget("fp", obra["id"]), width="stretch"):
-        bajar_fuera_programa(obra)
+                 key=clave_widget("fp", nodo["id"]), width="stretch",
+                 help="Para lo ejecutado que no figura en el programa de la obra. "
+                      "Se genera un ID de actividad y un Step propios, fuera del "
+                      "catálogo."):
+        bajar_fuera_programa(nodo)
+    st.divider()
 
 
 def pantalla_formulario():
