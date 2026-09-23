@@ -1,0 +1,11 @@
+# Credenciales: NUNCA subir a GitHub (van en Streamlit Cloud -> Settings -> Secrets)
+secrets.txt
+.streamlit/secrets.toml
+
+# Entorno local y archivos generados al usar la app en el PC
+.venv/
+__pycache__/
+*.db
+reportes_diarios.xlsx
+fotos_reportes/
+~$*

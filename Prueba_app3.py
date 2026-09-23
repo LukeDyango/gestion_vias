@@ -1,4 +1,5 @@
 ﻿import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import sqlite3
 import os
@@ -6,8 +7,13 @@ import io
 import json
 import base64
 import uuid
-from datetime import datetime
+import zipfile
+import time
+import numbers
+import calendar
+from datetime import datetime, date, timedelta
 import openpyxl
+import openpyxl.styles
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage, ImageOps
@@ -29,7 +35,7 @@ MOBILE_CSS = """
 footer {visibility: hidden;}
 header[data-testid="stHeader"] {background: transparent; height: 0.5rem;}
 
-.block-container {padding-top: 0.5rem; padding-bottom: 5.   5rem; max-width: 460px;}
+.block-container {padding-top: 0.5rem; padding-bottom: 5.5rem; max-width: 460px;}
 
 /* ---- Header (blue app bar) ---- */
 .app-header {
@@ -68,12 +74,13 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
     background: #2FA84F !important; color: #fff !important; border: none !important;
 }
 .st-key-btn_generar_reporte button { background: #0B3B8A !important; color: #fff !important; border: none !important; }
-.st-key-btn_add_trabajo button, .st-key-btn_add_equipo_otro button, .st-key-btn_add_material button,
+.st-key-btn_add_trabajo button, .st-key-btn_add_equipo_otro button, .st-key-btn_add_material button, .st-key-btn_add_collera button,
 .st-key-btn_add_trabajador button { background: #F1F3F6 !important; color: #0B3B8A !important; border: 1px dashed #0B3B8A !important; }
 .st-key-btn_backlog_avisos button { background: #0B3B8A !important; color: #fff !important; border: none !important; text-align: left !important; }
 .st-key-btn_backlog_ots button { background: #3D7DD9 !important; color: #fff !important; border: none !important; text-align: left !important; }
-.st-key-btn_reportes button, .st-key-btn_backup_reportes button { background: #F1F3F6 !important; color: #333 !important; border: 1px solid #dcdfe4 !important; text-align: left !important; }
+.st-key-btn_reportes button, .st-key-btn_backup_reportes button, .st-key-btn_preparar_respaldo button { background: #F1F3F6 !important; color: #333 !important; border: 1px solid #dcdfe4 !important; text-align: left !important; }
 .st-key-btn_mis_avisos button { background: #0B3B8A !important; color: #fff !important; border: none !important; text-align: left !important; }
+.st-key-btn_mis_reportes button { background: #3D7DD9 !important; color: #fff !important; border: none !important; text-align: left !important; }
 .st-key-btn_rechazar button { background: #DC3545 !important; color: #fff !important; border: none !important; }
 .st-key-btn_observar button { background: #E0A458 !important; color: #fff !important; border: none !important; }
 .st-key-btn_cerrar button, .st-key-btn_cerrar_ot button { background: #6c757d !important; color: #fff !important; border: none !important; }
@@ -107,6 +114,8 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
 .pie-dev .pie-dev-nombre { font-weight: 700; font-size: 13px; }
 .pie-dev .pie-dev-contacto { font-size: 11.5px; opacity: .9; margin-top: 2px; }
 .pie-dev .pie-dev-contacto a { color: #fff; text-decoration: underline; }
+/* ---- Componente invisible del historial del navegador (botón Atrás) ---- */
+.st-key-nav_historial_box { position: absolute; height: 0; overflow: hidden; margin: 0; }
 .st-key-btn_footer_whatsapp button {
     background: #25D366 !important; color: #fff !important; border: none !important;
     font-weight: 700 !important; margin-top: 8px !important;
@@ -210,28 +219,89 @@ def init_db():
     conn.commit()
     conn.close()
 
-def _leer_hoja_sheets_o_none(nombre_hoja: str, columnas: list):
-    """Intenta leer una hoja desde Google Sheets. Devuelve None si Sheets no está
-    configurado o falla, para que el llamador decida el respaldo (SQLite local)."""
+def _valores_hoja_sheets_directo(nombre_hoja: str) -> list:
+    """Lee todos los valores de una hoja de Google Sheets en UNA sola llamada a la API.
+    Lanza excepción si Sheets no está configurado o si la lectura falla: nunca devuelve
+    una hoja 'vacía' por un error transitorio (cuota, red), porque el llamador podría
+    tomarla como dato real y luego sobreescribir el Sheet con esa tabla vacía."""
     sh = _cliente_sheets()
     if sh is None:
-        return None
+        raise RuntimeError("Google Sheets no está configurado")
     try:
-        ws = _hoja_sheets(sh, nombre_hoja)
         # UNFORMATTED_VALUE: sin esto, Sheets entrega los números ya "formateados" como
         # texto según el locale de la hoja (chileno: coma decimal) -- ej. "46,644" -- y esa
         # coma se interpreta como separador de miles (asumiendo locale inglés), quedando
         # 46644. UNFORMATTED_VALUE trae el número real de vuelta, sin pasar por texto.
-        registros = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
-        return pd.DataFrame(registros) if registros else pd.DataFrame(columns=columnas)
+        resp = sh.values_get(f"'{nombre_hoja}'", params={"valueRenderOption": "UNFORMATTED_VALUE"})
+    except gspread.exceptions.APIError:
+        # Solo si la pestaña de verdad no existe se crea vacía; cualquier otro error se propaga.
+        try:
+            sh.worksheet(nombre_hoja)
+        except gspread.WorksheetNotFound:
+            _hoja_sheets(sh, nombre_hoja)
+            return [REPORTES_SHEETS[nombre_hoja]]
+        raise
+    return resp.get("values", [])
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _valores_hoja_sheets(nombre_hoja: str) -> list:
+    """Versión con caché (compartida entre usuarios, 60 s) de _valores_hoja_sheets_directo:
+    evita volver a pedirle a Google cada hoja en cada interacción de cada usuario (la API
+    permite ~60 lecturas por minuto). Se invalida apenas la app escribe algo en Sheets."""
+    return _valores_hoja_sheets_directo(nombre_hoja)
+
+def _invalidar_cache_sheets():
+    _valores_hoja_sheets.clear()
+
+def _fecha_desde_serial(valor):
+    """Las filas guardadas por versiones antiguas de la app (modo USER_ENTERED) quedaron
+    con las fechas convertidas por Google a número de serie (46235 = 2026-08-01). Con
+    UNFORMATTED_VALUE llegan como número: se devuelven al texto 'AAAA-MM-DD[ HH:MM]' que
+    usa el resto de la app. Cualquier otro valor se deja tal cual."""
+    if isinstance(valor, bool) or not isinstance(valor, (int, float)) or not 20000 <= valor <= 80000:
+        return valor
+    dt = datetime(1899, 12, 30) + timedelta(days=float(valor))
+    if float(valor).is_integer():
+        return dt.strftime("%Y-%m-%d")
+    return (dt + timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M")
+
+def _valores_a_df(valores: list, columnas: list) -> pd.DataFrame:
+    """Convierte la respuesta cruda de Sheets (lista de filas, la primera = encabezados) en
+    DataFrame. Sheets omite las celdas vacías al final de cada fila, así que se rellenan."""
+    if len(valores) <= 1:
+        return pd.DataFrame(columns=columnas)
+    headers = [str(h) for h in valores[0]]
+    n = len(headers)
+    filas = [(list(f) + [""] * n)[:n] for f in valores[1:]]
+    df = pd.DataFrame(filas, columns=headers)
+    for col in columnas:
+        if col not in df.columns:
+            df[col] = ""
+    for col in df.columns:
+        if col.startswith("Fecha"):
+            df[col] = df[col].map(_fecha_desde_serial)
+    return df
+
+def _leer_hoja_sheets_o_none(nombre_hoja: str, columnas: list, estricto: bool = False, fresco: bool = False):
+    """Lee una hoja desde Google Sheets. Devuelve None si Sheets no está configurado.
+    Si está configurado pero la lectura falla: con estricto=True lanza la excepción (para
+    que el llamador conserve lo que ya tenía), si no devuelve None (respaldo local).
+    fresco=True salta la caché (p.ej. para calcular el próximo correlativo)."""
+    if _cliente_sheets() is None:
+        return None
+    try:
+        lector = _valores_hoja_sheets_directo if fresco else _valores_hoja_sheets
+        return _valores_a_df(lector(nombre_hoja), columnas)
     except Exception:
+        if estricto:
+            raise
         return None
 
-def load_avisos():
+def load_avisos(estricto: bool = False):
     """Avisos: Google Sheets es la fuente de verdad cuando está configurado (así los avisos
     creados en Streamlit Cloud sobreviven a que el hosting reinicie el disco local); si no
     está configurado, o falla la conexión, se usa el SQLite local como respaldo."""
-    df = _leer_hoja_sheets_o_none("Avisos", AVISO_COLUMNS)
+    df = _leer_hoja_sheets_o_none("Avisos", AVISO_COLUMNS, estricto)
     if df is None:
         conn = get_db()
         df = pd.read_sql("SELECT * FROM avisos", conn)
@@ -247,9 +317,9 @@ def load_activos():
     conn.close()
     return df
 
-def load_ots():
+def load_ots(estricto: bool = False):
     """OTs: mismo criterio que load_avisos() -- Sheets primero si está configurado, si no SQLite."""
-    df = _leer_hoja_sheets_o_none("OTs", OTS_COLUMNS)
+    df = _leer_hoja_sheets_o_none("OTs", OTS_COLUMNS, estricto)
     if df is None:
         conn = get_db()
         df = pd.read_sql("SELECT * FROM ots", conn)
@@ -283,7 +353,7 @@ def save_all_ots():
 def cargar_colleras_de_pk(pk: int) -> list:
     conn = get_db()
     filas = conn.execute(
-        "SELECT ColleraID, Collera, KmDesde, KmHasta FROM colleras WHERE PK=? ORDER BY Collera",
+        "SELECT ColleraID, PK, Collera, Ubicacion, KmDesde, KmHasta FROM colleras WHERE PK=? ORDER BY Collera",
         (pk,)).fetchall()
     conn.close()
     return [dict(f) for f in filas]
@@ -294,11 +364,11 @@ def cargar_todas_colleras() -> pd.DataFrame:
     conn.close()
     return df
 
-def load_durmientes_estado() -> pd.DataFrame:
+def load_durmientes_estado(estricto: bool = False) -> pd.DataFrame:
     """Estado real de los durmientes: Google Sheets es la fuente de verdad si está
     configurado (así las inspecciones de terreno sobreviven a un reinicio de Streamlit
     Cloud), si no se usa el SQLite local -- mismo criterio que load_avisos()/load_ots()."""
-    df = _leer_hoja_sheets_o_none("DurmientesEstado", DURMIENTES_COLUMNS)
+    df = _leer_hoja_sheets_o_none("DurmientesEstado", DURMIENTES_COLUMNS, estricto)
     if df is None:
         conn = get_db()
         try:
@@ -355,78 +425,126 @@ def _estado_vigente(df_estado: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["FechaActualizacion", "_orden"])
     return df.groupby(["ColleraID", "Posicion"], as_index=False).tail(1).drop(columns="_orden")
 
-def cargar_estado_collera(collera_id: str) -> dict:
-    df = _estado_vigente(st.session_state.durmientes_estado)
-    if df.empty:
-        return {}
-    filas = df[df["ColleraID"] == collera_id]
-    return {int(r["Posicion"]): r["Estado"] for _, r in filas.iterrows()}
-
-def evaluar_collera(collera_id: str, ubicacion: str, df_estado_vigente: pd.DataFrame | None = None) -> dict:
-    """Replica exactamente la lógica de la hoja 'Control Durmientes' del Excel original
-    (Norma NS-01-01-00: mínimo 10 durmientes efectivos, racha máxima de 'Malo' según
-    Recta/Curva). `df_estado_vigente` debe ser el resultado de _estado_vigente() -- se
-    recibe ya calculado para no repetir el dedup en cada llamada dentro de un loop grande
-    (resumen_global_durmientes/resumen_por_pk evalúan las 2404 colleras)."""
-    if df_estado_vigente is None:
-        df_estado_vigente = _estado_vigente(st.session_state.durmientes_estado)
+def _estados_por_collera(df_estado_vigente: pd.DataFrame) -> dict:
+    """{ColleraID: {posición: estado}} a partir del estado vigente, en una sola pasada
+    (en vez de filtrar el DataFrame una vez por cada una de las 2404 colleras)."""
+    resultado = {}
     if df_estado_vigente.empty:
-        filas_collera = df_estado_vigente
-    else:
-        filas_collera = df_estado_vigente[df_estado_vigente["ColleraID"] == collera_id]
-    estados_por_posicion = {int(r["Posicion"]): r["Estado"] for _, r in filas_collera.iterrows()}
-    secuencia = [estados_por_posicion.get(p) for p in range(1, 24)]
+        return resultado
+    for cid, pos, est in zip(df_estado_vigente["ColleraID"], df_estado_vigente["Posicion"], df_estado_vigente["Estado"]):
+        if est:
+            resultado.setdefault(str(cid), {})[int(_num(pos))] = est
+    return resultado
 
-    total_registrado = sum(1 for e in secuencia if e)
-    n_buenos = secuencia.count("Bueno")
-    n_malos = secuencia.count("Malo")
-    n_nuevos = secuencia.count("Nuevo")
-    n_reempl = secuencia.count("Reemplazado")
-    efectivos = n_buenos + n_nuevos + n_reempl
-    pct_renov = (n_nuevos + n_reempl) / total_registrado if total_registrado else 0.0
+def cargar_estado_collera(collera_id: str) -> dict:
+    return _estados_por_collera(_estado_vigente(st.session_state.durmientes_estado)).get(str(collera_id), {})
 
+# Estados generales que cuentan como incumplimiento / como falta de datos (igual que el
+# Dashboard del Excel: "No Cumple" + "No Cumple (racha)"; "Sin Inspeccionar" + "Inspección Incompleta").
+ESTADOS_NO_CUMPLE = ("No Cumple", "No Cumple (racha)")
+ESTADOS_SIN_DATOS = ("Sin Inspeccionar", "Inspección Incompleta")
+
+def es_curva(ubicacion) -> bool:
+    """Igual que el Excel de control (columna AJ: IF(C12="Curva", ...)): solo la ubicación
+    exactamente 'Curva' usa el límite de racha de curva (máx. 2 'Malo' seguidos). Las demás
+    ('Curva < 1000', 'Principio Curva > 1000', etc.) se evalúan como recta (máx. 3), tal
+    como lo hace el Excel -- decisión confirmada por el usuario. La comparación de Excel
+    no distingue mayúsculas."""
+    return str(ubicacion or "").lower() == "curva"
+
+def evaluar_secuencia(secuencia: list, ubicacion: str) -> dict:
+    """Misma lógica que las columnas AA:AK de la hoja 'Control Durmientes' del Excel
+    (Norma NS-01-01-00, puntos 6.5.3 y 6.5.4). `secuencia` = estados de D1..D23
+    (None o "" = posición no inspeccionada; NO se asume 'Bueno')."""
+    secuencia = [(e or None) for e in secuencia]
+    total_registrado = sum(1 for e in secuencia if e)                    # AA
+    n_buenos = secuencia.count("Bueno")                                   # AB
+    n_malos = secuencia.count("Malo")                                     # AC
+    n_nuevos = secuencia.count("Nuevo")                                   # AD
+    n_reempl = secuencia.count("Reemplazado")                             # AE
+    efectivos = n_buenos + n_nuevos + n_reempl                            # AF
+    pct_renov = (n_nuevos + n_reempl) / total_registrado if total_registrado else 0.0  # AG
+
+    # Racha de 'Malo' consecutivos: una posición en blanco corta la racha (AH del Excel).
     racha, racha_max = 0, 0
     for e in secuencia:
         racha = racha + 1 if e == "Malo" else 0
         racha_max = max(racha_max, racha)
+    limite_racha = 2 if es_curva(ubicacion) else 3
 
-    if total_registrado == 0:
-        estado_general = "Sin Inspeccionar"
+    if total_registrado == 0:                                             # AI
+        min_efectivos = "Sin datos"
+    elif total_registrado < 10:
+        min_efectivos = "Incompleto"
     else:
-        limite_racha = 2 if "Curva" in (ubicacion or "") else 3
-        cumple_minimo = efectivos >= 10          # Norma 6.5.3
-        cumple_racha = racha_max <= limite_racha  # Norma 6.5.4
-        estado_general = "Cumple" if (cumple_minimo and cumple_racha) else "No Cumple"
+        min_efectivos = "Sí" if efectivos >= 10 else "No"
+
+    if total_registrado == 0:                                             # AJ
+        racha_consec = "Sin datos"
+    else:
+        racha_consec = "No" if racha_max > limite_racha else "Sí"
+
+    if racha_consec == "No":                                              # AK
+        estado_general = "No Cumple (racha)"
+    elif total_registrado == 0:
+        estado_general = "Sin Inspeccionar"
+    elif total_registrado < 10:
+        estado_general = "Inspección Incompleta"
+    elif min_efectivos == "Sí":
+        estado_general = "Cumple"
+    else:
+        estado_general = "No Cumple"
 
     return {
         "total_registrado": total_registrado, "n_buenos": n_buenos, "n_malos": n_malos,
         "n_nuevos": n_nuevos, "n_reempl": n_reempl, "efectivos": efectivos,
-        "pct_renovacion": pct_renov, "racha_max": racha_max, "estado_general": estado_general,
+        "pct_renovacion": pct_renov, "racha_max": racha_max, "limite_racha": limite_racha,
+        "min_efectivos": min_efectivos, "racha_consec": racha_consec, "estado_general": estado_general,
     }
 
-def resumen_global_durmientes() -> dict:
+def evaluar_collera(collera_id: str, ubicacion: str, df_estado_vigente: pd.DataFrame | None = None,
+                    estados_por_collera: dict | None = None) -> dict:
+    """Evalúa una collera con su estado vigente. Para loops grandes (las 2404 colleras)
+    pasar `estados_por_collera` ya calculado con _estados_por_collera()."""
+    if estados_por_collera is None:
+        if df_estado_vigente is None:
+            df_estado_vigente = _estado_vigente(st.session_state.durmientes_estado)
+        estados_por_collera = _estados_por_collera(df_estado_vigente)
+    estados = estados_por_collera.get(str(collera_id), {})
+    return evaluar_secuencia([estados.get(p) for p in range(1, 24)], ubicacion)
+
+def _evaluar_todas_colleras() -> list:
+    """[(fila del catálogo, evaluación)] de las 2404 colleras con el estado vigente."""
     df_colleras = cargar_todas_colleras()
-    df_estado = _estado_vigente(st.session_state.durmientes_estado)
-    resultados = [evaluar_collera(row["ColleraID"], row["Ubicacion"], df_estado) for _, row in df_colleras.iterrows()]
+    estados = _estados_por_collera(_estado_vigente(st.session_state.durmientes_estado))
+    return [(row, evaluar_collera(row["ColleraID"], row["Ubicacion"], estados_por_collera=estados))
+            for _, row in df_colleras.iterrows()]
+
+def resumen_global_durmientes() -> dict:
+    resultados = [ev for _, ev in _evaluar_todas_colleras()]
     cumplen = sum(1 for r in resultados if r["estado_general"] == "Cumple")
-    no_cumplen = sum(1 for r in resultados if r["estado_general"] == "No Cumple")
-    sin_datos = sum(1 for r in resultados if r["estado_general"] == "Sin Inspeccionar")
+    no_cumplen = sum(1 for r in resultados if r["estado_general"] in ESTADOS_NO_CUMPLE)
+    sin_datos = sum(1 for r in resultados if r["estado_general"] in ESTADOS_SIN_DATOS)
     evaluables = cumplen + no_cumplen
     pct_cumplimiento = (cumplen / evaluables * 100) if evaluables else 0.0
+    tot = {k: sum(r[k] for r in resultados) for k in ("total_registrado", "n_buenos", "n_malos", "n_nuevos", "n_reempl")}
+    pct_renov_global = ((tot["n_nuevos"] + tot["n_reempl"]) / tot["total_registrado"] * 100) if tot["total_registrado"] else 0.0
     return {"total": len(resultados), "cumplen": cumplen, "no_cumplen": no_cumplen,
-            "sin_datos": sin_datos, "pct_cumplimiento": pct_cumplimiento}
+            "sin_datos": sin_datos, "pct_cumplimiento": pct_cumplimiento,
+            "total_buenos": tot["n_buenos"], "total_malos": tot["n_malos"], "total_nuevos": tot["n_nuevos"],
+            "total_reempl": tot["n_reempl"], "pct_renov_global": pct_renov_global}
 
 def resumen_por_pk() -> list:
     """Una fila por PK: n° colleras, evaluadas, estado del km (Bueno/Regular/Malo/Sin Datos)."""
-    df_colleras = cargar_todas_colleras()
-    df_estado = _estado_vigente(st.session_state.durmientes_estado)
+    por_pk = {}
+    for row, ev in _evaluar_todas_colleras():
+        por_pk.setdefault(int(row["PK"]), []).append(ev)
     filas = []
-    for pk in sorted(df_colleras["PK"].unique()):
-        colleras_pk = df_colleras[df_colleras["PK"] == pk]
-        evals = [evaluar_collera(r["ColleraID"], r["Ubicacion"], df_estado) for _, r in colleras_pk.iterrows()]
+    for pk in sorted(por_pk):
+        evals = por_pk[pk]
         n_total = len(evals)
         n_con_datos = sum(1 for e in evals if e["total_registrado"] > 0)
-        n_no_cumplen = sum(1 for e in evals if e["estado_general"] == "No Cumple")
+        n_no_cumplen = sum(1 for e in evals if e["estado_general"] in ESTADOS_NO_CUMPLE)
         if n_con_datos == 0:
             estado_km = "Sin Datos"
         elif n_no_cumplen > 0:
@@ -435,9 +553,58 @@ def resumen_por_pk() -> list:
             estado_km = "Regular"
         else:
             estado_km = "Bueno"
+        tot_reg = sum(e["total_registrado"] for e in evals)
+        n_nue_reem = sum(e["n_nuevos"] + e["n_reempl"] for e in evals)
         filas.append({"PK": int(pk), "N° Colleras": n_total, "Con datos": n_con_datos,
+                      "Total Durm.": tot_reg,
+                      "Buenos": sum(e["n_buenos"] for e in evals), "Malos": sum(e["n_malos"] for e in evals),
+                      "Nuevos": sum(e["n_nuevos"] for e in evals), "Reempl.": sum(e["n_reempl"] for e in evals),
+                      "% Renov.": round(n_nue_reem / tot_reg * 100, 1) if tot_reg else 0.0,
                       "No cumplen": n_no_cumplen, "Estado KM": estado_km})
     return filas
+
+# Columnas de la foto de cada inspección de collera hecha en un Reporte Diario: la misma
+# fila que la hoja 'Control Durmientes' del Excel (D1..D23 + columnas calculadas).
+INSPECCION_COLUMNS = (
+    ["ReporteID", "Fecha", "ColleraID", "PK", "Collera", "Ubicacion"]
+    + [f"D{p}" for p in range(1, 24)]
+    + ["TotalRegistrado", "Buenos", "Malos", "Nuevos", "Reemplazados", "Efectivos",
+       "PctRenovacion", "MinEfectivos", "RachaConsec", "EstadoGeneral"]
+)
+
+def fila_inspeccion(reporte_id: str, fecha_str: str, collera: dict, secuencia: list) -> list:
+    ev = evaluar_secuencia(secuencia, collera["Ubicacion"])
+    return ([reporte_id, fecha_str, collera["ColleraID"], int(collera["PK"]), int(collera["Collera"]), collera["Ubicacion"]]
+            + [e or "" for e in secuencia]
+            + [ev["total_registrado"], ev["n_buenos"], ev["n_malos"], ev["n_nuevos"], ev["n_reempl"],
+               ev["efectivos"], round(ev["pct_renovacion"], 4), ev["min_efectivos"], ev["racha_consec"],
+               ev["estado_general"]])
+
+def filas_cambios_durmientes(reporte_id: str, fecha_str: str, secuencias: dict) -> list:
+    """Filas nuevas para el historial DurmientesEstado: {ColleraID: [23 estados]}. Solo
+    agrega las posiciones que cambian respecto al estado vigente (no ensucia el historial
+    con 'confirmaciones' sin cambio) y nunca sobreescribe filas anteriores, para poder
+    auditar cuándo y en qué reporte cambió cada durmiente. En blanco = no tocar."""
+    vigente = _estados_por_collera(_estado_vigente(st.session_state.durmientes_estado))
+    filas = []
+    for collera_id, secuencia in secuencias.items():
+        previos = vigente.get(str(collera_id), {})
+        for pos, estado in enumerate(secuencia, start=1):
+            if estado and estado != previos.get(pos):
+                filas.append([collera_id, pos, estado, fecha_str, reporte_id])
+    return filas
+
+def persistir_cambios_durmientes_local(filas: list):
+    """Tras guardar en Sheets (con guardar_bloques), refleja los cambios en la sesión y en
+    el SQLite local. Se AGREGAN filas en vez de reescribir todo el historial."""
+    if not filas:
+        return
+    st.session_state.durmientes_estado = pd.concat(
+        [st.session_state.durmientes_estado, pd.DataFrame(filas, columns=DURMIENTES_COLUMNS)], ignore_index=True)
+    conn = get_db()
+    conn.executemany("INSERT INTO durmientes_estado VALUES (?,?,?,?,?)", filas)
+    conn.commit()
+    conn.close()
 
 # -------------------------
 # Reporte Diario (Personal Terreno) - base de datos en Excel
@@ -456,6 +623,7 @@ REPORTES_SHEETS = {
     "Avisos": AVISO_COLUMNS,
     "OTs": OTS_COLUMNS,
     "DurmientesEstado": DURMIENTES_COLUMNS,
+    "InspeccionColleras": INSPECCION_COLUMNS,
 }
 
 DIAS_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
@@ -539,45 +707,140 @@ def _cliente_sheets():
     except Exception:
         return None
 
-def _hoja_sheets(spreadsheet, nombre_hoja: str):
-    headers = REPORTES_SHEETS[nombre_hoja]
+def _asegurar_hoja(spreadsheet, nombre_hoja: str, headers: list | None = None):
+    """Devuelve (worksheet, encabezados reales de la fila 1), creando la pestaña si no
+    existe. Si el esquema creció (p.ej. se agregó una columna nueva) y esta hoja ya
+    existía en el Sheet real, agrega los encabezados faltantes al final -- ampliando
+    primero la grilla: antes no se ampliaba, Google rechazaba la columna nueva con
+    'exceeds grid limits' y ese error, silenciado, hacía perder filas enteras (así se
+    perdieron las actividades del RPT-00014 en la hoja Trabajos)."""
+    headers = headers or REPORTES_SHEETS[nombre_hoja]
     try:
         ws = spreadsheet.worksheet(nombre_hoja)
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=nombre_hoja, rows=2000, cols=max(len(headers), 10))
-        ws.append_row(headers)
-        return ws
-    header_row = ws.row_values(1)
-    if not header_row:
-        ws.append_row(headers)
-    else:
-        # Si el esquema creció (p.ej. se agregó una columna nueva) y esta hoja ya
-        # existía en el Sheet real, agregamos los encabezados faltantes al final,
-        # igual que migrate_reportes_excel() ya hace para el Excel local.
-        faltantes = [h for h in headers if h not in header_row]
-        if faltantes:
-            base_col = len(header_row)
-            for i, h in enumerate(faltantes):
-                ws.update_cell(1, base_col + i + 1, h)
-    return ws
+        ws.update(values=[headers], range_name="A1", value_input_option="RAW")
+        return ws, list(headers)
+    header_row = [str(h) for h in ws.row_values(1)]
+    faltantes = [h for h in headers if h not in header_row]
+    if faltantes:
+        nuevo_header = header_row + faltantes
+        if len(nuevo_header) > ws.col_count:
+            ws.resize(cols=len(nuevo_header))
+        ws.update(values=[nuevo_header], range_name="A1", value_input_option="RAW")
+        header_row = nuevo_header
+    return ws, header_row
 
-def _leer_hoja_df(nombre_hoja: str) -> pd.DataFrame:
+def _hoja_sheets(spreadsheet, nombre_hoja: str, headers: list | None = None):
+    return _asegurar_hoja(spreadsheet, nombre_hoja, headers)[0]
+
+def _preparar_hojas(spreadsheet, nombres: list) -> dict:
+    """{nombre: (worksheet, encabezados reales)} para varias hojas con 2 llamadas a la API
+    en total (en vez de 2 por hoja). Solo si falta una hoja o columnas usa _asegurar_hoja."""
+    existentes = {ws.title: ws for ws in spreadsheet.worksheets()}
+    presentes = [n for n in nombres if n in existentes]
+    encabezados = {}
+    if presentes:
+        resp = spreadsheet.values_batch_get([f"'{n}'!1:1" for n in presentes])
+        for n, vr in zip(presentes, resp.get("valueRanges", [])):
+            encabezados[n] = [str(h) for h in (vr.get("values") or [[]])[0]]
+    resultado = {}
+    for n in nombres:
+        header = encabezados.get(n)
+        if n in existentes and header is not None and all(h in header for h in REPORTES_SHEETS[n]):
+            resultado[n] = (existentes[n], header)
+        else:
+            resultado[n] = _asegurar_hoja(spreadsheet, n)
+    return resultado
+
+def _fila_por_encabezado(fila: list, headers_app: list, header_real: list) -> list:
+    """Reordena una fila (en el orden de REPORTES_SHEETS) según el orden REAL de las
+    columnas de la hoja. Hojas creadas por versiones antiguas de la app tienen otro orden
+    (p.ej. Trabajos: KmDesde antes que ColleraDesdeID); escribir por posición dejaba los
+    datos en columnas equivocadas."""
+    valores = dict(zip(headers_app, fila))
+    return [valores.get(h, "") for h in header_real]
+
+def _celda_api(v) -> dict:
+    """Celda para la API batchUpdate. stringValue se guarda literal (como RAW): no se
+    reinterpreta con el locale chileno ni como fórmula."""
+    v = _celda_sheets(v)
+    if isinstance(v, bool):
+        return {"userEnteredValue": {"boolValue": v}}
+    if isinstance(v, numbers.Number):
+        return {"userEnteredValue": {"numberValue": float(v)}}
+    if v == "":
+        return {}
+    return {"userEnteredValue": {"stringValue": str(v)}}
+
+def _agregar_filas_excel_local(bloques: dict):
+    init_reportes_excel()
+    wb = openpyxl.load_workbook(REPORTES_XLSX_PATH)
+    for nombre_hoja, filas in bloques.items():
+        ws_local = wb[nombre_hoja]
+        header_real = [c.value for c in ws_local[1]]
+        for fila in filas:
+            ws_local.append(_fila_por_encabezado(fila, REPORTES_SHEETS[nombre_hoja], header_real))
+    wb.save(REPORTES_XLSX_PATH)
+
+def _reporte_ya_guardado(reporte_id: str) -> bool:
+    try:
+        df = _leer_hoja_sheets_o_none("Reportes", REPORTES_SHEETS["Reportes"], estricto=True, fresco=True)
+    except Exception:
+        return False
+    return df is not None and str(reporte_id) in set(df["ReporteID"].astype(str))
+
+def guardar_bloques(bloques: dict) -> bool:
+    """Agrega filas a varias hojas a la vez: {nombre_hoja: [filas en orden REPORTES_SHEETS]}.
+    En Google Sheets van TODAS en un solo batchUpdate, que Google aplica completo o no
+    aplica nada: un reporte ya no puede quedar a medias (cabecera guardada y actividades
+    perdidas). Reintenta 3 veces. Devuelve False si no quedó guardado de forma durable,
+    para que el llamador avise y NO limpie el formulario (así no se pierde lo ingresado).
+    El Excel local se escribe después, solo como copia para descargas del momento."""
+    bloques = {h: f for h, f in bloques.items() if f}
+    if not bloques:
+        return True
+    sh = _cliente_sheets()
+    if sh is not None:
+        reporte_id = bloques["Reportes"][0][0] if "Reportes" in bloques else None
+        ok = False
+        for intento in range(3):
+            if intento and reporte_id and _reporte_ya_guardado(reporte_id):
+                ok = True  # el intento anterior sí llegó a Google, solo falló la respuesta
+                break
+            try:
+                requests = []
+                hojas = _preparar_hojas(sh, list(bloques))
+                for nombre_hoja, filas in bloques.items():
+                    ws, header_real = hojas[nombre_hoja]
+                    requests.append({"appendCells": {
+                        "sheetId": ws.id,
+                        "rows": [{"values": [_celda_api(v) for v in _fila_por_encabezado(f, REPORTES_SHEETS[nombre_hoja], header_real)]}
+                                 for f in filas],
+                        "fields": "userEnteredValue",
+                    }})
+                sh.batch_update({"requests": requests})
+                ok = True
+                break
+            except Exception:
+                time.sleep(1.5 * (intento + 1))
+        _invalidar_cache_sheets()
+        if not ok:
+            return False
+    try:
+        _agregar_filas_excel_local(bloques)
+    except Exception:
+        if sh is None:
+            return False  # sin Sheets, el Excel local es el único registro
+    return True
+
+def _leer_hoja_df(nombre_hoja: str, fresco: bool = False) -> pd.DataFrame:
     """Lee una hoja completa como DataFrame: desde Google Sheets si está configurado
     (fuente de verdad, sobrevive reinicios), si no desde el Excel local."""
     columnas = REPORTES_SHEETS.get(nombre_hoja, [])
-    sh = _cliente_sheets()
-    if sh is not None:
-        try:
-            ws = _hoja_sheets(sh, nombre_hoja)
-            # UNFORMATTED_VALUE: evita que Sheets entregue los números como texto ya
-            # formateado según el locale (coma decimal chilena), que se leería mal
-            # (ver _leer_hoja_sheets_o_none más arriba para el detalle del bug).
-            registros = ws.get_all_records(value_render_option="UNFORMATTED_VALUE")
-            # Sin filas de datos, get_all_records() devuelve [] y pd.DataFrame([]) queda sin
-            # columnas -- forzamos las columnas esperadas para que df["ReporteID"] no reviente.
-            return pd.DataFrame(registros) if registros else pd.DataFrame(columns=columnas)
-        except Exception:
-            pass
+    df = _leer_hoja_sheets_o_none(nombre_hoja, columnas, fresco=fresco)
+    if df is not None:
+        return df
     if not os.path.exists(REPORTES_XLSX_PATH):
         return pd.DataFrame(columns=columnas)
     try:
@@ -585,31 +848,16 @@ def _leer_hoja_df(nombre_hoja: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame(columns=columnas)
 
-def _agregar_filas(nombre_hoja: str, filas: list):
-    """Agrega filas a una hoja: siempre al Excel local (para las descargas del momento),
-    y también a Google Sheets si está configurado (para que el histórico no se pierda
-    aunque la nube reinicie el almacenamiento local)."""
-    if not filas:
-        return
-    init_reportes_excel()
-    wb = openpyxl.load_workbook(REPORTES_XLSX_PATH)
-    ws_local = wb[nombre_hoja]
-    for fila in filas:
-        ws_local.append(fila)
-    wb.save(REPORTES_XLSX_PATH)
-
-    sh = _cliente_sheets()
-    if sh is not None:
-        try:
-            ws = _hoja_sheets(sh, nombre_hoja)
-            filas_texto = [[("" if v is None else v) for v in fila] for fila in filas]
-            # RAW (no USER_ENTERED): USER_ENTERED hace que el propio Sheet reinterprete los
-            # números según la configuración regional de la hoja -- con locale chileno (coma
-            # decimal, punto como separador de miles) "430.56" se leía como "43.056" y quedaba
-            # guardado como 43056. RAW escribe el valor literal, sin reinterpretación.
-            ws.append_rows(filas_texto, value_input_option="RAW")
-        except Exception:
-            pass  # si falla Sheets, el reporte igual quedó guardado en el Excel local
+def _celda_sheets(v):
+    """Valor apto para enviar a Sheets: None/NaN (celdas vacías de pandas) no son JSON válido."""
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return v
 
 def _num(val, default=0.0):
     """Convierte a número de forma segura; Sheets a veces entrega '' en celdas vacías."""
@@ -625,30 +873,166 @@ def _a_bool(val) -> bool:
     return str(val).strip().lower() in ("1", "true", "verdadero", "si", "sí")
 
 def _sincronizar_tabla_sheets(nombre_hoja: str, filas: list):
-    """Reemplaza por completo una hoja en Google Sheets con las filas dadas (borra y recrea
-    la pestaña). Se usa para tablas chicas que se reescriben enteras cada vez que cambian
-    -Avisos, OTs, PlanMensual- en vez de ir agregando filas como en Reportes/Trabajos."""
+    """Reemplaza por completo el contenido de una hoja en Google Sheets con las filas dadas.
+    Se usa para tablas chicas que se reescriben enteras cada vez que cambian -Avisos, OTs,
+    PlanMensual- en vez de ir agregando filas como en Reportes/Trabajos.
+    Primero escribe los datos nuevos encima y recién después limpia las filas sobrantes:
+    antes se borraba la pestaña y se recreaba, y si la API fallaba entre medio la tabla
+    completa se perdía en Sheets."""
     sh = _cliente_sheets()
     if sh is None:
         return
     headers = REPORTES_SHEETS[nombre_hoja]
+    # RAW (no USER_ENTERED): USER_ENTERED hace que el propio Sheet reinterprete los
+    # números según la configuración regional de la hoja -- con locale chileno (coma
+    # decimal, punto como separador de miles) "430.56" se leía como "43.056" y quedaba
+    # guardado como 43056. RAW escribe el valor literal, sin reinterpretación.
+    valores = [headers] + [[_celda_sheets(v) for v in fila] for fila in filas]
     try:
-        try:
-            ws = sh.worksheet(nombre_hoja)
-            sh.del_worksheet(ws)
-        except gspread.WorksheetNotFound:
-            pass
-        ws = sh.add_worksheet(title=nombre_hoja, rows=max(len(filas) + 10, 50), cols=len(headers))
-        ws.append_row(headers)
-        if filas:
-            filas_texto = [[("" if v is None else v) for v in fila] for fila in filas]
-            # RAW (no USER_ENTERED): USER_ENTERED hace que el propio Sheet reinterprete los
-            # números según la configuración regional de la hoja -- con locale chileno (coma
-            # decimal, punto como separador de miles) "430.56" se leía como "43.056" y quedaba
-            # guardado como 43056. RAW escribe el valor literal, sin reinterpretación.
-            ws.append_rows(filas_texto, value_input_option="RAW")
+        ws = _hoja_sheets(sh, nombre_hoja)
+        filas_grilla = max(ws.row_count, len(valores))
+        cols_grilla = max(ws.col_count, len(headers))
+        if filas_grilla > ws.row_count or cols_grilla > ws.col_count:
+            ws.resize(rows=filas_grilla, cols=cols_grilla)
+        ws.update(values=valores, range_name="A1", value_input_option="RAW")
+        if filas_grilla > len(valores):
+            ws.batch_clear([f"A{len(valores) + 1}:{get_column_letter(cols_grilla)}{filas_grilla}"])
     except Exception:
         pass  # si falla Sheets, los datos igual quedaron guardados localmente
+    finally:
+        _invalidar_cache_sheets()
+
+# -------------------------
+# Respaldo de fotos en Google Sheets
+# Las fotos se guardaban solo en el disco local, que Streamlit Cloud borra al reiniciar.
+# Se guardan además en la hoja "FotosData" del mismo Sheet: la foto comprimida, en base64,
+# partida en trozos de 45.000 caracteres (una celda admite 50.000). Se usa Sheets y no
+# Drive porque una cuenta de servicio no tiene cuota para subir archivos a un Drive
+# personal. Cuando una foto falta en el disco, se reconstruye desde esa hoja.
+# -------------------------
+FOTOS_DATA_HOJA = "FotosData"
+FOTOS_DATA_COLUMNS = ["ReporteID", "NombreArchivo", "Parte", "TotalPartes", "Datos"]
+FOTO_MAX_LADO = 1280   # px del lado mayor: suficiente para el PDF (13 cm de ancho)
+FOTO_CALIDAD = 75
+FOTO_CHUNK = 45000
+
+def _ruta_foto_local(reporte_id, nombre) -> str:
+    return os.path.join(FOTOS_DIR, str(reporte_id), str(nombre))
+
+def _ubicar_foto(reporte_id, nombre, ruta_original="") -> str | None:
+    """Ruta local donde está la foto ahora mismo, o None si no está en el disco."""
+    ruta = _ruta_foto_local(reporte_id, nombre)
+    if os.path.exists(ruta):
+        return ruta
+    if isinstance(ruta_original, str) and ruta_original and os.path.exists(ruta_original):
+        return ruta_original
+    return None
+
+def _respaldar_fotos_sheets(reporte_id: str, fotos: list) -> bool | None:
+    """Sube a FotosData las fotos [(nombre, ruta)] de un reporte. Devuelve None si Sheets
+    no está configurado, True si todas quedaron respaldadas y False si alguna falló."""
+    sh = _cliente_sheets()
+    if sh is None or not fotos:
+        return None
+    try:
+        ws = _hoja_sheets(sh, FOTOS_DATA_HOJA, FOTOS_DATA_COLUMNS)
+    except Exception:
+        return False
+    todo_ok = True
+    for nombre, ruta in fotos:
+        try:
+            with open(ruta, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("ascii")
+            partes = [b64[i:i + FOTO_CHUNK] for i in range(0, len(b64), FOTO_CHUNK)]
+            filas = [[str(reporte_id), nombre, i + 1, len(partes), p] for i, p in enumerate(partes)]
+            # Una llamada por foto, para no mandar varios MB en un solo request.
+            ws.append_rows(filas, value_input_option="RAW")
+        except Exception:
+            todo_ok = False
+    _indice_fotos_sheets.clear()
+    return todo_ok
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _indice_fotos_sheets() -> dict:
+    """{(ReporteID, NombreArchivo): {parte: n° de fila}} de la hoja FotosData. Lee solo las
+    columnas chicas (A:C), no los datos de las fotos. Lanza excepción si no se puede leer
+    (las excepciones no quedan en caché, así que se reintenta en la próxima llamada)."""
+    sh = _cliente_sheets()
+    if sh is None:
+        return {}
+    resp = sh.values_get(f"'{FOTOS_DATA_HOJA}'!A2:C", params={"valueRenderOption": "UNFORMATTED_VALUE"})
+    indice = {}
+    for i, fila in enumerate(resp.get("values", [])):
+        if len(fila) < 3:
+            continue
+        clave = (str(fila[0]), str(fila[1]))
+        # Si una foto se subió dos veces, gana la última subida.
+        indice.setdefault(clave, {})[int(_num(fila[2]))] = i + 2
+    return indice
+
+def _restaurar_fotos_desde_sheets(pares: list):
+    """Reconstruye en el disco local las fotos [(ReporteID, NombreArchivo)] que falten,
+    descargándolas de FotosData (varias por llamada a la API)."""
+    faltantes = [(str(r), str(n)) for r, n in pares if not os.path.exists(_ruta_foto_local(r, n))]
+    sh = _cliente_sheets()
+    if not faltantes or sh is None:
+        return
+    try:
+        indice = _indice_fotos_sheets()
+    except Exception:
+        return
+    faltantes = [p for p in dict.fromkeys(faltantes) if p in indice]
+    for i in range(0, len(faltantes), 10):
+        grupo = faltantes[i:i + 10]
+        rangos, meta = [], []
+        for r, n in grupo:
+            partes = indice[(r, n)]
+            filas = [partes[k] for k in sorted(partes)]
+            meta.append((r, n, len(filas)))
+            rangos += [f"'{FOTOS_DATA_HOJA}'!E{fila}" for fila in filas]
+        try:
+            resp = sh.values_batch_get(rangos, params={"valueRenderOption": "UNFORMATTED_VALUE"})
+        except Exception:
+            continue
+        trozos = [str((vr.get("values") or [[""]])[0][0]) for vr in resp.get("valueRanges", [])]
+        pos = 0
+        for r, n, k in meta:
+            b64 = "".join(trozos[pos:pos + k])
+            pos += k
+            try:
+                datos = base64.b64decode(b64, validate=True)
+            except Exception:
+                continue
+            ruta = _ruta_foto_local(r, n)
+            os.makedirs(os.path.dirname(ruta), exist_ok=True)
+            with open(ruta, "wb") as f:
+                f.write(datos)
+
+def subir_fotos_locales_faltantes() -> int:
+    """Sube a FotosData las fotos que existen en el disco local pero todavía no están
+    respaldadas (reportes guardados antes de este respaldo). Devuelve cuántas subió."""
+    if _cliente_sheets() is None:
+        return 0
+    df_fot = _leer_hoja_df("Fotos")
+    if df_fot.empty:
+        return 0
+    try:
+        indice = _indice_fotos_sheets()
+    except Exception:
+        indice = {}
+    por_reporte = {}
+    for _, f in df_fot.iterrows():
+        rid, nombre = str(f["ReporteID"]), str(f["NombreArchivo"])
+        if (rid, nombre) in indice:
+            continue
+        ruta = _ubicar_foto(rid, nombre, f.get("RutaArchivo"))
+        if ruta:
+            por_reporte.setdefault(rid, []).append((nombre, ruta))
+    n = 0
+    for rid, fotos in por_reporte.items():
+        if _respaldar_fotos_sheets(rid, fotos):
+            n += len(fotos)
+    return n
 
 def migrate_reportes_excel():
     """Agrega hojas/columnas nuevas a un libro ya existente sin tocar los datos previos."""
@@ -687,7 +1071,13 @@ def init_reportes_excel():
     wb.save(REPORTES_XLSX_PATH)
 
 def next_reporte_id():
-    df = _leer_hoja_df("Reportes")
+    """Próximo correlativo RPT-xxxxx. Con Sheets configurado se lee sin caché y en modo
+    estricto: si Google no responde, lanza excepción en vez de calcular el número con el
+    Excel local (que en la nube puede estar vacío y repetiría RPT-00001, pisando reportes)."""
+    if _cliente_sheets() is not None:
+        df = _leer_hoja_sheets_o_none("Reportes", REPORTES_SHEETS["Reportes"], estricto=True, fresco=True)
+    else:
+        df = _leer_hoja_df("Reportes")
     nums = []
     if not df.empty and "ReporteID" in df.columns:
         for val in df["ReporteID"].astype(str):
@@ -697,14 +1087,6 @@ def next_reporte_id():
                 pass
     n = (max(nums) + 1) if nums else 1
     return f"RPT-{n:05d}"
-
-def guardar_reporte_excel(reporte_row, trabajos_rows, equipos_rows, materiales_rows, asistencia_rows, fotos_rows):
-    _agregar_filas("Reportes", [reporte_row])
-    _agregar_filas("Trabajos", trabajos_rows)
-    _agregar_filas("Equipos", equipos_rows)
-    _agregar_filas("Materiales", materiales_rows)
-    _agregar_filas("Asistencia", asistencia_rows)
-    _agregar_filas("Fotos", fotos_rows)
 
 def obtener_actividades_hoy(usuario: str) -> list:
     """Actividades registradas en el/los Reporte(s) Diario(s) de hoy para este usuario."""
@@ -738,20 +1120,98 @@ def guardar_plan_mensual(filas: list):
 
     _sincronizar_tabla_sheets("PlanMensual", filas)
 
-def ejecutado_por_actividad(anio: int, mes: int) -> dict:
-    """Suma la Cantidad ejecutada por Actividad en un mes/año, a partir de los Reportes
-    Diarios reales (hoja Trabajos, cruzada con Reportes para filtrar por Fecha)."""
+def ejecutado_por_rango(desde: date, hasta: date) -> dict:
+    """Suma la Cantidad ejecutada por Actividad entre dos fechas (ambas incluidas), a partir
+    de los Reportes Diarios reales (hoja Trabajos, cruzada con Reportes por Fecha)."""
     df_rep = _leer_hoja_df("Reportes")
     df_trab = _leer_hoja_df("Trabajos")
     if df_rep.empty or df_trab.empty:
         return {}
-    fechas = pd.to_datetime(df_rep["Fecha"], errors="coerce")
-    reportes_mes = df_rep[(fechas.dt.year == anio) & (fechas.dt.month == mes)]["ReporteID"].tolist()
-    if not reportes_mes:
+    # Fechas ilegibles quedan como NaT y se descartan (antes NaT hacía caer la comparación).
+    fechas = pd.to_datetime(df_rep["Fecha"].map(_fecha_desde_serial).astype(str).str[:10], errors="coerce")
+    en_rango = fechas.notna() & (fechas >= pd.Timestamp(desde)) & (fechas <= pd.Timestamp(hasta))
+    reportes = set(df_rep[en_rango]["ReporteID"].astype(str))
+    if not reportes:
         return {}
-    trab_mes = df_trab[df_trab["ReporteID"].isin(reportes_mes)].copy()
-    trab_mes["Cantidad"] = trab_mes["Cantidad"].apply(_num)
-    return trab_mes.groupby("Actividad")["Cantidad"].sum().to_dict()
+    trab = df_trab[df_trab["ReporteID"].astype(str).isin(reportes)].copy()
+    trab["Cantidad"] = trab["Cantidad"].apply(_num)
+    return trab.groupby("Actividad")["Cantidad"].sum().to_dict()
+
+def ejecutado_por_actividad(anio: int, mes: int) -> dict:
+    return ejecutado_por_rango(date(anio, mes, 1), date(anio, mes, calendar.monthrange(anio, mes)[1]))
+
+def _plan_por_mes(df_plan: pd.DataFrame) -> dict:
+    """{(año, mes): {actividad: cantidad planificada}}"""
+    plan = {}
+    for _, r in df_plan.iterrows():
+        clave = (int(_num(r["Anio"])), int(_num(r["Mes"])))
+        plan.setdefault(clave, {})
+        plan[clave][r["Actividad"]] = plan[clave].get(r["Actividad"], 0.0) + _num(r["CantidadPlanificada"])
+    return plan
+
+def plan_por_rango(df_plan: pd.DataFrame, desde: date, hasta: date) -> dict:
+    """Planificado por actividad entre dos fechas. El plan se define por mes; para una
+    semana (o cualquier tramo) se prorratea por día: plan del mes / días del mes × días
+    del tramo que caen en ese mes. Para un mes completo da exactamente el plan del mes."""
+    if df_plan.empty or hasta < desde:
+        return {}
+    plan_mes = _plan_por_mes(df_plan)
+    total = {}
+    dia = desde
+    while dia <= hasta:
+        fin_mes = date(dia.year, dia.month, calendar.monthrange(dia.year, dia.month)[1])
+        tramo_fin = min(fin_mes, hasta)
+        fraccion = ((tramo_fin - dia).days + 1) / fin_mes.day
+        for act, cant in plan_mes.get((dia.year, dia.month), {}).items():
+            total[act] = total.get(act, 0.0) + cant * fraccion
+        dia = tramo_fin + timedelta(days=1)
+    return total
+
+def semanas_del_mes(anio: int, mes: int) -> list:
+    """Semanas (lunes a domingo) del mes, recortadas a los días del mes: [(inicio, fin)]."""
+    primero = date(anio, mes, 1)
+    ultimo = date(anio, mes, calendar.monthrange(anio, mes)[1])
+    semanas = []
+    inicio = primero
+    while inicio <= ultimo:
+        fin = min(inicio + timedelta(days=6 - inicio.weekday()), ultimo)
+        semanas.append((inicio, fin))
+        inicio = fin + timedelta(days=1)
+    return semanas
+
+def tabla_plan_vs_ejecutado(plan: dict, ejecutado: dict, unidades: dict, extra: dict | None = None) -> pd.DataFrame:
+    """Una fila por actividad: Planificado, Ejecutado y Avance %. Incluye actividades
+    ejecutadas que no estén en el catálogo (p.ej. nombres antiguos) para no esconderlas."""
+    actividades = ACTIVIDADES_TRABAJO + [a for a in list(plan) + list(ejecutado) if a not in ACTIVIDADES_TRABAJO]
+    filas = []
+    for act in dict.fromkeys(actividades):
+        plan_val = float(plan.get(act, 0.0))
+        ejec_val = float(ejecutado.get(act, 0.0))
+        avance = (ejec_val / plan_val * 100) if plan_val > 0 else (100.0 if ejec_val > 0 else 0.0)
+        fila = {"Actividad": act, "Unidad": unidades.get(act) or "—"}
+        for nombre, valores in (extra or {}).items():
+            fila[nombre] = round(float(valores.get(act, 0.0)), 3)
+        fila.update({"Planificado": round(plan_val, 3), "Ejecutado": round(ejec_val, 3), "Avance %": round(avance, 1)})
+        filas.append(fila)
+    return pd.DataFrame(filas)
+
+def grafico_avance(df: pd.DataFrame):
+    """Barras de Avance % por actividad (solo las que tienen plan o ejecución), con la
+    línea del 100 %. Verde ≥ 100 %, amarillo ≥ 70 %, rojo < 70 %."""
+    df = df[(df["Planificado"] > 0) | (df["Ejecutado"] > 0)].copy()
+    if df.empty:
+        return None
+    df["Tramo"] = df["Avance %"].apply(lambda v: "≥ 100%" if v >= 100 else ("70–99%" if v >= 70 else "< 70%"))
+    barras = alt.Chart(df).mark_bar().encode(
+        x=alt.X("Avance %:Q", title="Avance %"),
+        y=alt.Y("Actividad:N", sort="-x", title=None, axis=alt.Axis(labelLimit=180)),
+        color=alt.Color("Tramo:N", scale=alt.Scale(domain=["≥ 100%", "70–99%", "< 70%"],
+                                                   range=["#2FA84F", "#E0A458", "#DC3545"]),
+                        legend=alt.Legend(title=None, orient="bottom")),
+        tooltip=["Actividad:N", "Planificado:Q", "Ejecutado:Q", "Avance %:Q"],
+    )
+    regla = alt.Chart(pd.DataFrame({"x": [100]})).mark_rule(strokeDash=[4, 4], color="#0B3B8A").encode(x="x:Q")
+    return (barras + regla).properties(height=max(120, 28 * len(df)))
 
 def _ciclo_anual(anio: int, mes: int) -> list:
     """Los 12 (Año, Mes) del ciclo de mantención Septiembre-Agosto que contiene el mes
@@ -895,9 +1355,65 @@ def generar_excel_reporte(resumen: dict) -> bytes:
                 ws.cell(row=fila, column=1, value=f"(No se pudo incrustar: {nombre})")
                 fila += 1
 
+    if resumen.get("colleras"):
+        hoja_excel_durmientes(wb, resumen["colleras"])
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+# Colores de la hoja 'Control Durmientes' del Excel original (formato condicional).
+_RELLENO_ESTADO_DURM = {"Bueno": "C6EFCE", "Malo": "FFC7CE", "Nuevo": "BDD7EE", "Reemplazado": "E4DFEC"}
+_RELLENO_ESTADO_GENERAL = {"Cumple": "C6EFCE", "No Cumple": "FFC7CE", "No Cumple (racha)": "FFC7CE",
+                           "Inspección Incompleta": "FFEB9C", "Sin Inspeccionar": "D9D9D9"}
+_LETRA_ESTADO = {"Bueno": "B", "Malo": "M", "Nuevo": "N", "Reemplazado": "R"}
+
+def _secuencia_en_letras(secuencia: list) -> str:
+    """'BMMMB MMBBB ...' en grupos de 5, para que el PDF pueda cortar la línea."""
+    letras = "".join(_LETRA_ESTADO.get(e, "-") for e in secuencia)
+    return " ".join(letras[i:i + 5] for i in range(0, len(letras), 5))
+
+def hoja_excel_durmientes(wb, colleras: list, con_reporte: bool = False):
+    """Agrega una hoja 'Durmientes' con el mismo formato que 'Control Durmientes' del Excel
+    (una fila por collera: D1..D23 + columnas calculadas). `colleras` = lista de
+    resumen_collera(); con_reporte=True agrega ReporteID y Fecha al inicio (histórico)."""
+    ws = wb.create_sheet("Durmientes")
+    base = ["REPORTE", "FECHA"] if con_reporte else []
+    headers = base + ["PK", "COLLERA", "UBICACIÓN"] + [f"D{p}" for p in range(1, 24)] + [
+        "TOTAL REGISTRADO", "N° BUENOS", "N° MALOS", "N° NUEVOS", "N° REEMPL.", "EFECTIVOS (B+N+R)",
+        "% RENOV. (N+R)", "MÍN. EFECTIVOS", "RACHA CONSEC.", "ESTADO GENERAL"]
+    ws.append(headers)
+    for celda in ws[1]:
+        celda.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
+        celda.fill = openpyxl.styles.PatternFill("solid", fgColor="0B3B8A")
+        celda.alignment = openpyxl.styles.Alignment(wrap_text=True, horizontal="center", vertical="center")
+    col_d1 = len(base) + 4
+    for c in colleras:
+        ws.append(([c.get("reporte_id", ""), c.get("fecha", "")] if con_reporte else [])
+                  + [c["pk"], c["collera"], c["ubicacion"]] + [e or "" for e in c["secuencia"]]
+                  + [c["total_registrado"], c["n_buenos"], c["n_malos"], c["n_nuevos"], c["n_reempl"],
+                     c["efectivos"], c["pct_renovacion"], c["min_efectivos"], c["racha_consec"], c["estado_general"]])
+        fila = ws.max_row
+        for i, e in enumerate(c["secuencia"]):
+            if e in _RELLENO_ESTADO_DURM:
+                ws.cell(row=fila, column=col_d1 + i).fill = openpyxl.styles.PatternFill("solid", fgColor=_RELLENO_ESTADO_DURM[e])
+        ws.cell(row=fila, column=col_d1 + 29).number_format = "0.0%"
+        celda_estado = ws.cell(row=fila, column=col_d1 + 32)
+        if c["estado_general"] in _RELLENO_ESTADO_GENERAL:
+            celda_estado.fill = openpyxl.styles.PatternFill("solid", fgColor=_RELLENO_ESTADO_GENERAL[c["estado_general"]])
+    anchos = ([11, 11] if con_reporte else []) + [6, 9, 22] + [11] * 23 + [11, 9, 9, 9, 9, 11, 10, 11, 10, 20]
+    _ajustar_anchos_columnas(ws, anchos)
+    ws.freeze_panes = ws.cell(row=2, column=col_d1)
+
+def colleras_desde_inspecciones(df_insp: pd.DataFrame) -> list:
+    """Convierte filas de la hoja InspeccionColleras en la lista de resumen_collera()."""
+    colleras = []
+    for _, r in df_insp.iterrows():
+        secuencia = [(r.get(f"D{p}") or None) if isinstance(r.get(f"D{p}"), str) else None for p in range(1, 24)]
+        info = {"ColleraID": str(r["ColleraID"]), "PK": int(_num(r["PK"])), "Collera": int(_num(r["Collera"])),
+                "Ubicacion": str(r["Ubicacion"])}
+        colleras.append({**resumen_collera(info, secuencia), "reporte_id": str(r["ReporteID"]), "fecha": str(r["Fecha"])})
+    return colleras
 
 def generar_pdf_reporte(resumen: dict) -> bytes:
     buf = io.BytesIO()
@@ -950,6 +1466,21 @@ def generar_pdf_reporte(resumen: dict) -> bytes:
     ]
     el.append(_tabla_pdf(headers_trab, filas_trab, anchos_trab))
     el.append(Spacer(1, 12))
+
+    if resumen.get("colleras"):
+        el.append(_seccion_pdf("Control de Durmientes por Collera (Norma NS-01-01-00)"))
+        el.append(Spacer(1, 4))
+        headers_col = ["Collera", "Ubicación", "D1 → D23", "B", "M", "N", "R", "Efect.", "% Renov.", "Mín. Efect.", "Racha", "Estado"]
+        anchos_col = [40, 52, 112, 20, 20, 20, 20, 32, 38, 44, 36, 76]
+        filas_col = [
+            [c["collera_id"], c["ubicacion"], _secuencia_en_letras(c["secuencia"]),
+             c["n_buenos"], c["n_malos"], c["n_nuevos"], c["n_reempl"], c["efectivos"],
+             f"{c['pct_renovacion'] * 100:.1f}%", c["min_efectivos"], c["racha_consec"], c["estado_general"]]
+            for c in resumen["colleras"]
+        ]
+        el.append(_tabla_pdf(headers_col, filas_col, anchos_col))
+        el.append(Paragraph("B = Bueno · M = Malo · N = Nuevo · R = Reemplazado · - = sin inspeccionar", _ESTILO_CELDA_PDF))
+        el.append(Spacer(1, 12))
 
     el.append(_seccion_pdf("Equipos"))
     el.append(Spacer(1, 4))
@@ -1071,6 +1602,11 @@ def generar_respaldo_plano() -> bytes | None:
         ws.append(fila)
     _ajustar_anchos_columnas(ws, FLAT_COL_WIDTHS)
 
+    # Todas las inspecciones de colleras hechas en Reportes Diarios, en el formato del Excel de control.
+    df_insp = _leer_hoja_df("InspeccionColleras")
+    if not df_insp.empty:
+        hoja_excel_durmientes(wb, colleras_desde_inspecciones(df_insp), con_reporte=True)
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -1118,6 +1654,81 @@ def generar_respaldo_pdf() -> bytes | None:
     doc.build(el, onFirstPage=_pie, onLaterPages=_pie)
     return buf.getvalue()
 
+def generar_respaldo_fotos_zip() -> bytes | None:
+    """ZIP con todas las fotos del histórico, una carpeta por ReporteID. Las fotos que ya
+    no están en el disco local (reinicio de Streamlit Cloud) se recuperan desde Sheets."""
+    df_fot = _leer_hoja_df("Fotos")
+    if df_fot.empty:
+        return None
+    registros = [(str(f["ReporteID"]), str(f["NombreArchivo"]), f.get("RutaArchivo")) for _, f in df_fot.iterrows()]
+    _restaurar_fotos_desde_sheets([(rid, nombre) for rid, nombre, _ in registros])
+    buf = io.BytesIO()
+    n = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:  # JPEG ya viene comprimido
+        for rid, nombre, ruta_original in dict.fromkeys(registros):
+            ruta = _ubicar_foto(rid, nombre, ruta_original)
+            if ruta:
+                zf.write(ruta, arcname=f"{rid}/{nombre}")
+                n += 1
+    return buf.getvalue() if n else None
+
+def resumen_desde_historico(reporte_id: str) -> dict | None:
+    """Arma el mismo 'resumen' que produce guardar_reporte(), pero leyendo un reporte ya
+    guardado desde Sheets/Excel -- para volver a generar su Excel y PDF (con fotos)."""
+    df_rep = _leer_hoja_df("Reportes")
+    if df_rep.empty:
+        return None
+    fila_rep = df_rep[df_rep["ReporteID"].astype(str) == str(reporte_id)]
+    if fila_rep.empty:
+        return None
+    rep = fila_rep.iloc[0]
+
+    def _de(nombre_hoja):
+        df = _leer_hoja_df(nombre_hoja)
+        return df[df["ReporteID"].astype(str) == str(reporte_id)] if not df.empty else df
+
+    def _txt(v):
+        return "" if v is None or (isinstance(v, float) and pd.isna(v)) else v
+
+    trabajos = [
+        {"actividad": t["Actividad"], "collera_desde_id": _txt(t.get("ColleraDesdeID")),
+         "collera_hasta_id": _txt(t.get("ColleraHastaID")), "km_desde": _txt(t["KmDesde"]),
+         "km_hasta": _txt(t["KmHasta"]), "unidad": _txt(t["Unidad"]), "cantidad": _num(t["Cantidad"]),
+         "hombres": int(_num(t["Hombres"])), "hh": _num(t["HH"])}
+        for _, t in _de("Trabajos").iterrows()
+    ]
+    equipos = [{"nombre": e["Equipo"], "cantidad": _num(e["Cantidad"])} for _, e in _de("Equipos").iterrows()]
+    materiales = [
+        {"nombre": m["Material"], "cantidad": _num(m["Cantidad"]), "estado": _txt(m.get("Estado"))}
+        for _, m in _de("Materiales").iterrows()
+    ]
+    asistencia = [
+        {"nombre": a["Trabajador"], "cargo": a["Cargo"], "estado": a["Estado"]}
+        for _, a in _de("Asistencia").iterrows()
+    ]
+    df_fot = _de("Fotos")
+    _restaurar_fotos_desde_sheets([(reporte_id, n) for n in df_fot["NombreArchivo"].astype(str)] if not df_fot.empty else [])
+    fotos = []
+    for _, f in df_fot.iterrows():
+        ruta = _ubicar_foto(reporte_id, f["NombreArchivo"], f.get("RutaArchivo"))
+        if ruta:
+            fotos.append((str(f["NombreArchivo"]), ruta))
+
+    fecha = str(rep["Fecha"])[:10]
+    try:
+        horas_dia = horas_jornada_por_fecha(datetime.strptime(fecha, "%Y-%m-%d"))
+    except ValueError:
+        horas_dia = "—"
+    return {
+        "reporte_id": str(reporte_id), "fecha": fecha, "grupo_via": _txt(rep["GrupoVia"]),
+        "usuario": _txt(rep["Usuario"]), "horas_dia": horas_dia,
+        "ubicacion": _txt(rep.get("Ubicacion")), "observaciones": _txt(rep.get("Observaciones")),
+        "trabajos": trabajos, "equipos": equipos, "materiales": materiales,
+        "asistencia": asistencia, "fotos": fotos,
+        "colleras": colleras_desde_inspecciones(_de("InspeccionColleras")),
+        "total_hh": sum(t["hh"] for t in trabajos),
+    }
+
 def mostrar_detalle_reporte_diario(reporte_id: str):
     """Vista de solo lectura de un Reporte Diario, para que el validador vea exactamente
     lo que ingresó Personal de Terreno (sin poder editarlo desde acá)."""
@@ -1149,6 +1760,18 @@ def mostrar_detalle_reporte_diario(reporte_id: str):
     else:
         st.caption("Sin actividades registradas.")
 
+    df_insp = _leer_hoja_df("InspeccionColleras")
+    insp_rep = df_insp[df_insp["ReporteID"].astype(str) == str(reporte_id)] if not df_insp.empty else df_insp
+    if not insp_rep.empty:
+        st.markdown("**🛤️ Control de Durmientes por Collera**")
+        for c in colleras_desde_inspecciones(insp_rep):
+            with st.container(border=True):
+                st.markdown(f"**Collera {c['collera_id']}** · {c['ubicacion']}")
+                st.markdown(franja_durmientes(c["secuencia"]))
+                badge(c["estado_general"], TIPO_BADGE_ESTADO.get(c["estado_general"], "info"))
+                st.dataframe(tabla_indicadores_collera(c), hide_index=True, width="stretch")
+        st.caption("🟩 Bueno · 🟥 Malo · 🟦 Nuevo · 🟪 Reemplazado · ⬜ sin inspeccionar")
+
     st.markdown("**🚜 Equipos**")
     equipos_rep = df_equ[df_equ["ReporteID"] == reporte_id].drop(columns=["ReporteID"])
     if not equipos_rep.empty:
@@ -1177,16 +1800,39 @@ def mostrar_detalle_reporte_diario(reporte_id: str):
     st.markdown("**📷 Fotografías**")
     fotos_rep = df_fot[df_fot["ReporteID"] == reporte_id]
     if not fotos_rep.empty:
+        _restaurar_fotos_desde_sheets([(reporte_id, n) for n in fotos_rep["NombreArchivo"].astype(str)])
         cols = st.columns(2)
         for i, (_, f) in enumerate(fotos_rep.iterrows()):
-            ruta = f["RutaArchivo"]
+            ruta = _ubicar_foto(reporte_id, f["NombreArchivo"], f["RutaArchivo"])
             with cols[i % 2]:
-                if isinstance(ruta, str) and os.path.exists(ruta):
+                if ruta:
                     st.image(ruta, caption=f["NombreArchivo"], width="stretch")
                 else:
                     st.caption(f"(No disponible: {f['NombreArchivo']})")
     else:
         st.caption("Sin fotografías.")
+
+    st.markdown("**⬇️ Descargar este reporte**")
+    clave_docs = f"docs_historico_{reporte_id}"
+    if st.button("📄 Preparar Excel y PDF", key=f"btn_prep_docs_{reporte_id}", width="stretch"):
+        with st.spinner("Generando documentos..."):
+            resumen = resumen_desde_historico(reporte_id)
+            st.session_state[clave_docs] = generar_documentos_reporte(resumen) if resumen else None
+    docs = st.session_state.get(clave_docs)
+    if docs:
+        excel_bytes, pdf_bytes = docs
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "⬇️ Excel", data=excel_bytes, file_name=f"Reporte_{reporte_id}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"btn_dl_excel_{reporte_id}", width="stretch",
+            )
+        with d2:
+            st.download_button(
+                "⬇️ PDF", data=pdf_bytes, file_name=f"Reporte_{reporte_id}.pdf", mime="application/pdf",
+                key=f"btn_dl_pdf_{reporte_id}", width="stretch",
+            )
 
 # -------------------------
 # Perfiles / roles
@@ -1207,6 +1853,16 @@ def init_data():
         st.session_state.page = "Inicio"
     if "activos" not in st.session_state:
         st.session_state.activos = load_activos()
+    # Avisos, OTs y durmientes se refrescan en cada recarga (desde la caché de Sheets, 60 s),
+    # para que se vea lo que guardaron otros usuarios sin tener que volver a iniciar sesión.
+    # estricto=True: si Sheets falla en un refresco, se conserva lo que ya había en la sesión
+    # en vez de caer al SQLite local, que en la nube puede estar vacío o desactualizado.
+    for clave, cargador in (("avisos", load_avisos), ("ots", load_ots), ("durmientes_estado", load_durmientes_estado)):
+        if clave in st.session_state:
+            try:
+                st.session_state[clave] = cargador(estricto=True)
+            except Exception:
+                pass
     if "avisos" not in st.session_state:
         st.session_state.avisos = load_avisos()
     if "ots" not in st.session_state:
@@ -1224,6 +1880,8 @@ def init_data():
         st.session_state.selected_aviso = None
     if "reporte_trabajos" not in st.session_state:
         st.session_state.reporte_trabajos = []
+    if "reporte_colleras" not in st.session_state:
+        st.session_state.reporte_colleras = []
     if "reporte_equipos_catalogo" not in st.session_state:
         st.session_state.reporte_equipos_catalogo = {nombre: {"usado": False, "cantidad": 1.0} for nombre in EQUIPOS_CATALOGO}
     if "reporte_equipos_otros" not in st.session_state:
@@ -1292,6 +1950,7 @@ def new_material_row():
 
 def reset_reporte_form():
     st.session_state.reporte_trabajos = []
+    st.session_state.reporte_colleras = []
     st.session_state.reporte_equipos_catalogo = {nombre: {"usado": False, "cantidad": 1.0} for nombre in EQUIPOS_CATALOGO}
     st.session_state.reporte_equipos_otros = []
     st.session_state.reporte_materiales = []
@@ -1628,29 +2287,113 @@ def render_trabajos_section():
                 row["cantidad"] = st.number_input("Cantidad", min_value=0.0, value=float(row["cantidad"]), step=1.0, key=f"trab_cant_{rid}")
             row["hombres"] = st.number_input("N° Trabajadores (Hombre)", min_value=0, value=int(row["hombres"]), step=1, key=f"trab_hom_{rid}")
 
-            if colleras_pk and row["actividad"] == "Inspección Vía" and idx_desde == idx_hasta:
-                with st.expander("📋 Registrar estado de durmientes de esta collera"):
-                    collera_id = row["collera_desde_id"]
-                    estados_actuales = cargar_estado_collera(collera_id)
-                    opciones_estado = ["", "Bueno", "Malo", "Nuevo", "Reemplazado"]
-                    nuevos_estados = {}
-                    cols_durm = st.columns(4)
-                    for pos in range(1, 24):
-                        with cols_durm[(pos - 1) % 4]:
-                            valor_actual = estados_actuales.get(pos, "")
-                            nuevos_estados[pos] = st.selectbox(
-                                f"D{pos}", opciones_estado,
-                                index=opciones_estado.index(valor_actual) if valor_actual in opciones_estado else 0,
-                                key=f"durm_{rid}_{pos}",
-                            )
-                    row["durmientes_collera_id"] = collera_id
-                    row["durmientes_estados"] = nuevos_estados
-            else:
-                row.pop("durmientes_collera_id", None)
-                row.pop("durmientes_estados", None)
+            if row["actividad"] in ("Inspección Vía", "Reemplazo de Durmientes Común"):
+                st.caption("🛤️ Registra el estado de los durmientes en la sección **Control de Durmientes por Collera** (más abajo).")
 
             if st.button("🗑 Eliminar actividad", key=f"trab_del_{rid}"):
                 st.session_state.reporte_trabajos = [r for r in st.session_state.reporte_trabajos if r["id"] != rid]
+                st.rerun()
+
+# -------------------------
+# Control de Durmientes por Collera (en el Reporte Diario, lo ingresa el Jefe de Grupo)
+# -------------------------
+ETIQUETA_ESTADO = {"Bueno": "Bueno", "Malo": "Malo", "Nuevo": "Nuevo", "Reemplazado": "Reempl."}
+CUADRO_ESTADO = {"Bueno": "🟩", "Malo": "🟥", "Nuevo": "🟦", "Reemplazado": "🟪"}
+TIPO_BADGE_ESTADO = {"Cumple": "ok", "No Cumple": "bad", "No Cumple (racha)": "bad",
+                     "Inspección Incompleta": "warn", "Sin Inspeccionar": "muted"}
+
+def new_collera_row():
+    return {"id": new_row_id(), "pk": 33}
+
+def _clave_durmiente(rid: str, collera_id: str, pos: int) -> str:
+    return f"durm_{rid}_{collera_id}_{pos}"
+
+def _completar_vacios(rid: str, collera_id: str, estado: str):
+    for pos in range(1, 24):
+        clave = _clave_durmiente(rid, collera_id, pos)
+        if not st.session_state.get(clave):
+            st.session_state[clave] = estado
+
+def _restaurar_vigente(rid: str, collera_id: str):
+    vigente = cargar_estado_collera(collera_id)
+    for pos in range(1, 24):
+        st.session_state[_clave_durmiente(rid, collera_id, pos)] = vigente.get(pos)
+
+def tabla_indicadores_collera(ev: dict) -> pd.DataFrame:
+    """Los mismos indicadores de la hoja 'Control Durmientes' del Excel (columnas AA:AK)."""
+    return pd.DataFrame([
+        ("TOTAL REGISTRADO", ev["total_registrado"]),
+        ("N° BUENOS", ev["n_buenos"]),
+        ("N° MALOS", ev["n_malos"]),
+        ("N° NUEVOS", ev["n_nuevos"]),
+        ("N° REEMPL.", ev["n_reempl"]),
+        ("EFECTIVOS (B+N+R)", ev["efectivos"]),
+        ("% RENOV. (N+R)", f"{ev['pct_renovacion'] * 100:.1f}%"),
+        ("MÍN. EFECTIVOS (≥10)", ev["min_efectivos"]),
+        (f"RACHA CONSEC. (máx. {ev['limite_racha']} Malo)", f"{ev['racha_consec']} (racha {ev['racha_max']})"),
+        ("ESTADO GENERAL", ev["estado_general"]),
+    ], columns=["Indicador", "Valor"]).astype(str)
+
+def franja_durmientes(secuencia: list) -> str:
+    return "".join(CUADRO_ESTADO.get(e, "⬜") for e in secuencia)
+
+def render_colleras_section():
+    st.caption(
+        "Registra el estado de cada durmiente (D1 a D23) de las colleras que inspeccionaste o "
+        "intervenidas hoy. Se precarga el último estado conocido; deja sin marcar lo que no "
+        "inspeccionaste (no se asume 'Bueno'). Norma NS-01-01-00: mínimo 10 efectivos y "
+        "máximo 3 'Malo' seguidos en recta / 2 en curva."
+    )
+    if not st.session_state.reporte_colleras:
+        st.caption("Aún no hay colleras agregadas.")
+    for item in st.session_state.reporte_colleras:
+        rid = item["id"]
+        with st.container(border=True):
+            item["pk"] = st.number_input("PK", min_value=33, max_value=61, step=1, value=int(item["pk"]), key=f"col_pk_{rid}")
+            colleras_pk = cargar_colleras_de_pk(item["pk"])
+            if not colleras_pk:
+                st.warning(f"No hay colleras registradas para el PK {item['pk']}.")
+                item.pop("collera", None)
+                continue
+            por_id = {c["ColleraID"]: c for c in colleras_pk}
+            collera_id = st.selectbox(
+                "Collera", list(por_id), key=f"col_sel_{rid}",
+                format_func=lambda cid: (f"Collera {por_id[cid]['Collera']} · km {por_id[cid]['KmDesde']:.3f}–"
+                                         f"{por_id[cid]['KmHasta']:.3f} · {por_id[cid]['Ubicacion']}"),
+            )
+            collera = por_id[collera_id]
+
+            vigente = cargar_estado_collera(collera_id)
+            for pos in range(1, 24):
+                clave = _clave_durmiente(rid, collera_id, pos)
+                if clave not in st.session_state:
+                    st.session_state[clave] = vigente.get(pos)
+
+            b1, b2 = st.columns(2)
+            with b1:
+                st.button("✅ Marcar vacíos como Bueno", key=f"col_llenar_{rid}",
+                          on_click=_completar_vacios, args=(rid, collera_id, "Bueno"))
+            with b2:
+                st.button("↩️ Volver al último estado", key=f"col_restaurar_{rid}",
+                          on_click=_restaurar_vigente, args=(rid, collera_id))
+
+            secuencia = []
+            for pos in range(1, 24):
+                secuencia.append(st.segmented_control(
+                    f"D{pos}", ESTADOS_DURMIENTE, format_func=ETIQUETA_ESTADO.get,
+                    key=_clave_durmiente(rid, collera_id, pos),
+                ))
+            item["collera"] = collera
+            item["secuencia"] = secuencia
+
+            ev = evaluar_secuencia(secuencia, collera["Ubicacion"])
+            st.markdown(f"**D1 → D23:** {franja_durmientes(secuencia)}")
+            st.caption("🟩 Bueno · 🟥 Malo · 🟦 Nuevo · 🟪 Reemplazado · ⬜ sin inspeccionar")
+            badge(ev["estado_general"], TIPO_BADGE_ESTADO.get(ev["estado_general"], "info"))
+            st.dataframe(tabla_indicadores_collera(ev), hide_index=True, width="stretch")
+
+            if st.button("🗑 Quitar collera", key=f"col_del_{rid}"):
+                st.session_state.reporte_colleras = [c for c in st.session_state.reporte_colleras if c["id"] != rid]
                 st.rerun()
 
 def render_equipos_section():
@@ -1814,43 +2557,31 @@ def equipos_seleccionados():
     seleccion += [{"nombre": o["nombre"], "cantidad": o["cantidad"]} for o in st.session_state.reporte_equipos_otros]
     return seleccion
 
-def _registrar_cambios_durmientes(reporte_id: str, fecha_str: str, trabajos: list):
-    """Registra el estado de durmientes reportado en terreno como historial de cambios:
-    si el valor reportado es igual al vigente no agrega nada (evita ensuciar el historial
-    con 'confirmaciones' sin cambio real); si es distinto, agrega una fila NUEVA -- nunca
-    sobreescribe una fila anterior -- para poder auditar cuándo y en qué reporte cambió
-    cada durmiente. Deja en blanco = no tocar lo que ya había (no se asume 'Bueno' por
-    defecto, igual que el Excel)."""
-    df_vigente = _estado_vigente(st.session_state.durmientes_estado)
-    filas_nuevas = []
-    for t in trabajos:
-        estados = t.get("durmientes_estados")
-        collera_id = t.get("durmientes_collera_id")
-        if not estados or not collera_id:
-            continue
-        for pos, estado in estados.items():
-            if not estado:
-                continue
-            if not df_vigente.empty:
-                anterior = df_vigente[(df_vigente["ColleraID"] == collera_id) & (df_vigente["Posicion"] == pos)]
-            else:
-                anterior = df_vigente
-            estado_previo = anterior.iloc[0]["Estado"] if not anterior.empty else None
-            if estado == estado_previo:
-                continue
-            filas_nuevas.append({"ColleraID": collera_id, "Posicion": pos, "Estado": estado,
-                                 "FechaActualizacion": fecha_str, "ReporteID": reporte_id})
-    if filas_nuevas:
-        st.session_state.durmientes_estado = pd.concat(
-            [st.session_state.durmientes_estado, pd.DataFrame(filas_nuevas)], ignore_index=True)
-        save_all_durmientes_estado()
+def resumen_collera(collera: dict, secuencia: list) -> dict:
+    """Datos de una collera inspeccionada, para el PDF/Excel del reporte."""
+    return {"collera_id": collera["ColleraID"], "pk": int(collera["PK"]), "collera": int(collera["Collera"]),
+            "ubicacion": collera["Ubicacion"], "secuencia": list(secuencia),
+            **evaluar_secuencia(secuencia, collera["Ubicacion"])}
 
 def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_subidas):
     trabajos = st.session_state.reporte_trabajos
     if not trabajos:
         return {"ok": False, "msg": "Agrega al menos una actividad en la sección Trabajos antes de guardar."}
 
-    reporte_id = next_reporte_id()
+    colleras_insp = [c for c in st.session_state.reporte_colleras if c.get("collera")]
+    ids_colleras = [c["collera"]["ColleraID"] for c in colleras_insp]
+    repetidas = sorted({cid for cid in ids_colleras if ids_colleras.count(cid) > 1})
+    if repetidas:
+        return {"ok": False, "msg": f"La collera {', '.join(repetidas)} está agregada más de una vez. Deja solo una."}
+    vacias = [c["collera"]["ColleraID"] for c in colleras_insp if not any(c["secuencia"])]
+    if vacias:
+        return {"ok": False, "msg": f"La collera {', '.join(vacias)} no tiene ningún durmiente marcado. Márcalos o quítala."}
+
+    try:
+        reporte_id = next_reporte_id()
+    except Exception:
+        return {"ok": False, "msg": "No se pudo conectar con Google Sheets para numerar el reporte. "
+                                    "Revisa la señal e intenta de nuevo: lo que ingresaste sigue en el formulario."}
     horas_dia = horas_jornada_por_fecha(fecha_reporte)
     fecha_str = fecha_reporte.strftime("%Y-%m-%d")
     reporte_row = [reporte_id, fecha_str, grupo_via, st.session_state.usuario, observaciones or "", now_str(), ubicacion or ""]
@@ -1861,7 +2592,9 @@ def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_su
          t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hombres"], t["hh"]]
         for t in trabajos_calc
     ]
-    _registrar_cambios_durmientes(reporte_id, fecha_str, trabajos)
+    inspeccion_rows = [fila_inspeccion(reporte_id, fecha_str, c["collera"], c["secuencia"]) for c in colleras_insp]
+    cambios_durmientes = filas_cambios_durmientes(
+        reporte_id, fecha_str, {c["collera"]["ColleraID"]: c["secuencia"] for c in colleras_insp})
     equipos_usados = equipos_seleccionados()
     equipos_rows = [[reporte_id, e["nombre"], e["cantidad"]] for e in equipos_usados]
     materiales_rows = [
@@ -1883,10 +2616,12 @@ def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_su
             try:
                 # Normaliza a JPEG estándar: los celulares suelen entregar formatos
                 # (MPO, HEIC, etc.) que PIL abre pero openpyxl no sabe incrustar al guardar.
+                # Se achica a FOTO_MAX_LADO para que el respaldo en Sheets sea liviano.
                 img = PILImage.open(foto)
                 img = ImageOps.exif_transpose(img)
                 img = img.convert("RGB")
-                img.save(ruta, format="JPEG", quality=85)
+                img.thumbnail((FOTO_MAX_LADO, FOTO_MAX_LADO))
+                img.save(ruta, format="JPEG", quality=FOTO_CALIDAD, optimize=True)
             except Exception:
                 nombre_final = foto.name
                 ruta = os.path.join(carpeta_fotos, nombre_final)
@@ -1895,7 +2630,16 @@ def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_su
             fotos_guardadas.append((nombre_final, ruta))
     fotos_rows = [[reporte_id, nombre, ruta] for nombre, ruta in fotos_guardadas]
 
-    guardar_reporte_excel(reporte_row, trabajos_rows, equipos_rows, materiales_rows, asistencia_rows, fotos_rows)
+    guardado = guardar_bloques({
+        "Reportes": [reporte_row], "Trabajos": trabajos_rows, "Equipos": equipos_rows,
+        "Materiales": materiales_rows, "Asistencia": asistencia_rows, "Fotos": fotos_rows,
+        "InspeccionColleras": inspeccion_rows, "DurmientesEstado": cambios_durmientes,
+    })
+    if not guardado:
+        return {"ok": False, "msg": "No se pudo guardar el reporte en Google Sheets (sin conexión o Google no respondió). "
+                                    "No se guardó nada a medias: lo que ingresaste sigue en el formulario, intenta de nuevo."}
+    persistir_cambios_durmientes_local(cambios_durmientes)
+    fotos_respaldo = _respaldar_fotos_sheets(reporte_id, fotos_guardadas)
 
     resumen = {
         "reporte_id": reporte_id, "fecha": fecha_str, "grupo_via": grupo_via,
@@ -1906,13 +2650,20 @@ def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_su
         "materiales": list(st.session_state.reporte_materiales),
         "asistencia": list(st.session_state.reporte_asistencia),
         "fotos": fotos_guardadas,
+        "fotos_respaldo": fotos_respaldo,
+        "colleras": [resumen_collera(c["collera"], c["secuencia"]) for c in colleras_insp],
         "total_hh": sum(t["hh"] for t in trabajos_calc),
     }
 
+    texto_colleras = ""
+    if resumen["colleras"]:
+        n_no = sum(1 for c in resumen["colleras"] if c["estado_general"] in ESTADOS_NO_CUMPLE)
+        texto_colleras = f" {len(resumen['colleras'])} collera(s) inspeccionada(s), {n_no} no cumple(n) la norma."
     resumen_texto = (
         f"Reporte Diario {reporte_id} · {fecha_str} · {len(trabajos_calc)} actividad(es), "
         f"{len(resumen['equipos'])} equipo(s), {len(resumen['materiales'])} material(es), "
         f"{len(resumen['asistencia'])} trabajador(es) en asistencia, {resumen['total_hh']:.0f} HH totales."
+        + texto_colleras
     )
     resumen["aviso_id"] = crear_aviso_desde_reporte(reporte_id, grupo_via, ubicacion, resumen_texto)
 
@@ -1943,6 +2694,13 @@ def page_generar_reporte():
     render_trabajos_section()
     if st.button("➕ Agregar actividad", key="btn_add_trabajo"):
         st.session_state.reporte_trabajos.append(new_trabajo_row())
+        st.rerun()
+
+    st.divider()
+    st.markdown("#### 🛤️ Control de Durmientes por Collera")
+    render_colleras_section()
+    if st.button("➕ Agregar collera", key="btn_add_collera"):
+        st.session_state.reporte_colleras.append(new_collera_row())
         st.rerun()
 
     st.divider()
@@ -2076,6 +2834,11 @@ def page_reporte_guardado():
         st.metric("Asistencia", len(resumen["asistencia"]))
         st.metric("HH totales", f"{resumen['total_hh']:.0f}")
     st.caption(f"Grupo Vía {resumen['grupo_via']} · {resumen['fecha']} · Reportado por {resumen['usuario']}")
+    if resumen.get("fotos_respaldo") is False:
+        st.warning(
+            "El reporte quedó guardado, pero alguna foto no se pudo respaldar en Google Sheets. "
+            "Descarga el PDF ahora para no perderla, o avisa al administrador."
+        )
 
     st.divider()
     st.markdown("#### Descargar reporte")
@@ -2140,6 +2903,42 @@ def terreno_inicio():
     if st.button(f"📋  Mis Avisos · {pend} Pendientes", key="btn_mis_avisos"):
         st.session_state.page = "Mis Avisos"
         st.rerun()
+    if st.button("🗂️  Mis Reportes (histórico)", key="btn_mis_reportes"):
+        st.session_state.page = "Mis Reportes"
+        st.rerun()
+
+def terreno_mis_reportes():
+    """Los Reportes Diarios ya enviados por este usuario, leídos desde Google Sheets: quedan
+    guardados aunque la app se reinicie, y se pueden abrir y volver a descargar."""
+    app_header("Mis Reportes", back_page="Inicio")
+    perfil_bar()
+    df_rep = _leer_hoja_df("Reportes")
+    mios = df_rep[df_rep["Usuario"].astype(str) == str(st.session_state.usuario)] if not df_rep.empty else df_rep
+    if mios.empty:
+        st.info("Aún no has enviado Reportes Diarios.")
+        return
+    mios = mios.sort_values(["Fecha", "ReporteID"], ascending=False, key=lambda s: s.astype(str))
+    st.caption(f"{len(mios)} reporte(s) enviados.")
+    for _, rep in mios.iterrows():
+        rid = str(rep["ReporteID"])
+        colA, colB = st.columns([4, 1])
+        with colA:
+            st.markdown(f"**{rid}** · {rep['Fecha']}")
+            st.caption(f"Grupo Vía {rep['GrupoVia']} · creado {rep.get('FechaCreacion', '')}")
+        with colB:
+            if st.button("Ver ›", key=f"ver_rep_{rid}"):
+                st.session_state.selected_reporte = rid
+                st.session_state.page = "Detalle Reporte"
+                st.rerun()
+
+def terreno_detalle_reporte():
+    app_header("Detalle Reporte", back_page="Mis Reportes")
+    perfil_bar()
+    reporte_id = st.session_state.get("selected_reporte")
+    if not reporte_id:
+        st.info("Selecciona un reporte desde Mis Reportes.")
+        return
+    mostrar_detalle_reporte_diario(reporte_id)
 
 def terreno_mis_avisos():
     app_header("Mis Avisos", back_page="Inicio")
@@ -2174,6 +2973,10 @@ def flujo_terreno():
         page_reporte_guardado()
     elif page == "Mis Avisos":
         terreno_mis_avisos()
+    elif page == "Mis Reportes":
+        terreno_mis_reportes()
+    elif page == "Detalle Reporte":
+        terreno_detalle_reporte()
     else:
         st.session_state.page = "Inicio"
         st.rerun()
@@ -2213,28 +3016,53 @@ def validador_inicio():
         st.info("Próximamente: dashboard de KPIs.")
 
     st.markdown("##### Descargar histórico completo")
-    col_excel, col_pdf = st.columns(2)
-    respaldo_bytes = generar_respaldo_plano()
-    with col_excel:
-        if respaldo_bytes:
-            st.download_button(
-                "💾  Excel",
-                data=respaldo_bytes,
-                file_name="reportes_diarios_respaldo.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="btn_backup_reportes", width="stretch",
-            )
-    with col_pdf:
-        respaldo_pdf_bytes = generar_respaldo_pdf()
-        if respaldo_pdf_bytes:
-            st.download_button(
-                "📄  PDF",
-                data=respaldo_pdf_bytes,
-                file_name="reportes_diarios_respaldo.pdf",
-                mime="application/pdf",
-                key="btn_backup_reportes_pdf", width="stretch",
-            )
+    # Se genera a pedido (no en cada recarga de Inicio): arma el Excel y el PDF de todo el
+    # histórico y junta las fotos, recuperando desde Sheets las que falten en el disco.
+    if st.button("📦  Preparar descarga del histórico", key="btn_preparar_respaldo"):
+        with st.spinner("Leyendo el histórico desde Google Sheets..."):
+            st.session_state.respaldo_excel = generar_respaldo_plano()
+            st.session_state.respaldo_pdf = generar_respaldo_pdf()
+            st.session_state.respaldo_fotos_zip = generar_respaldo_fotos_zip()
+            st.session_state.respaldo_generado = now_str()
+    if st.session_state.get("respaldo_generado"):
+        st.caption(f"Histórico preparado el {st.session_state.respaldo_generado}.")
+        if not (st.session_state.respaldo_excel or st.session_state.respaldo_fotos_zip):
+            st.info("Todavía no hay Reportes Diarios en el histórico.")
+        col_excel, col_pdf, col_fotos = st.columns(3)
+        with col_excel:
+            if st.session_state.respaldo_excel:
+                st.download_button(
+                    "💾  Excel",
+                    data=st.session_state.respaldo_excel,
+                    file_name="reportes_diarios_respaldo.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="btn_backup_reportes", width="stretch",
+                )
+        with col_pdf:
+            if st.session_state.respaldo_pdf:
+                st.download_button(
+                    "📄  PDF",
+                    data=st.session_state.respaldo_pdf,
+                    file_name="reportes_diarios_respaldo.pdf",
+                    mime="application/pdf",
+                    key="btn_backup_reportes_pdf", width="stretch",
+                )
+        with col_fotos:
+            if st.session_state.respaldo_fotos_zip:
+                st.download_button(
+                    "🖼️  Fotos (ZIP)",
+                    data=st.session_state.respaldo_fotos_zip,
+                    file_name="reportes_diarios_fotos.zip",
+                    mime="application/zip",
+                    key="btn_backup_fotos", width="stretch",
+                )
 
+    if st.session_state.perfil == "Sacyr":  # herramientas de recuperación: solo Sacyr (no ADI, EFE ni Subcontrato)
+        render_avanzado_sacyr()
+
+    st.markdown("<div style='text-align:center;opacity:.5;padding-top:10px;'>sacyr</div>", unsafe_allow_html=True)
+
+def render_avanzado_sacyr():
     with st.expander("⚙️ Avanzado"):
         st.caption(
             "Si un Reporte Diario aparece en el respaldo pero no en el Backlog de Avisos, "
@@ -2250,7 +3078,19 @@ def validador_inicio():
                 st.info("No hay avisos faltantes por recuperar.")
             st.rerun()
 
-    st.markdown("<div style='text-align:center;opacity:.5;padding-top:10px;'>sacyr</div>", unsafe_allow_html=True)
+        st.divider()
+        st.caption(
+            "Las fotos de reportes guardados antes del respaldo en Google Sheets existen solo "
+            "en el disco del servidor (se pierden si Streamlit Cloud reinicia). Este botón sube "
+            "a Sheets las que todavía estén en el disco."
+        )
+        if st.button("🖼️ Respaldar fotos locales en Google Sheets", key="btn_subir_fotos_locales"):
+            with st.spinner("Subiendo fotos..."):
+                n = subir_fotos_locales_faltantes()
+            if n:
+                st.success(f"Se respaldaron {n} foto(s) ✅")
+            else:
+                st.info("No hay fotos locales pendientes de respaldar (o Google Sheets no está configurado).")
 
 def validador_backlog():
     app_header("Backlog de Avisos", back_page="Inicio", right_icon="➕")
@@ -2535,24 +3375,75 @@ def page_planificacion():
 
     st.divider()
     st.markdown("#### Plan vs Ejecutado")
-    st.caption("«Ejecutado» se calcula automáticamente sumando lo registrado en los Reportes Diarios de ese mes.")
+    st.caption("«Ejecutado» se calcula automáticamente sumando lo registrado en los Reportes Diarios del período.")
+    vista = st.segmented_control(
+        "Período", ["Semanal", "Mensual", "Anual (Sep–Ago)"], default="Mensual", key="plan_vista",
+    ) or "Mensual"
 
-    ejecutado = ejecutado_por_actividad(anio, mes)
-    meta_anual = meta_anual_por_actividad(df_plan, anio, mes)
-    filas_comparacion = []
-    for act in ACTIVIDADES_TRABAJO:
-        plan_val = float(plan_actual.get(act, 0.0))
-        ejec_val = float(ejecutado.get(act, 0.0))
-        avance = (ejec_val / plan_val * 100) if plan_val > 0 else (100.0 if ejec_val > 0 else 0.0)
-        filas_comparacion.append({
-            "Actividad": act,
-            "Unidad": unidad_actual.get(act) or "—",
-            "Meta Anual": round(float(meta_anual.get(act, 0.0)), 3),
-            "Planificado": plan_val,
-            "Ejecutado": ejec_val,
-            "Avance %": round(avance, 1),
-        })
-    st.dataframe(pd.DataFrame(filas_comparacion), hide_index=True, width="stretch")
+    if vista == "Semanal":
+        semanas = semanas_del_mes(anio, mes)
+        hoy_d = hoy.date()
+        idx_hoy = next((i for i, (a, b) in enumerate(semanas) if a <= hoy_d <= b), 0)
+        idx = st.selectbox(
+            "Semana", list(range(len(semanas))), index=idx_hoy, key=f"plan_semana_{anio}_{mes}",
+            format_func=lambda i: f"Semana {i + 1} · {semanas[i][0]:%d/%m} al {semanas[i][1]:%d/%m}",
+        )
+        desde, hasta = semanas[idx]
+        st.caption(
+            f"Planificado de la semana = plan de {MESES_ES[mes - 1]} prorrateado por día "
+            f"({(hasta - desde).days + 1} de {calendar.monthrange(anio, mes)[1]} días)."
+        )
+        df_comp = tabla_plan_vs_ejecutado(plan_por_rango(df_plan, desde, hasta), ejecutado_por_rango(desde, hasta), unidad_actual)
+        st.dataframe(df_comp, hide_index=True, width="stretch")
+
+        st.markdown(f"##### Ejecutado por semana — {MESES_ES[mes - 1]} {anio}")
+        st.caption("Cada celda: ejecutado / planificado de esa semana.")
+        pivote = {"Actividad": []}
+        datos_semanas = [(plan_por_rango(df_plan, a, b), ejecutado_por_rango(a, b)) for a, b in semanas]
+        actividades = [a for a in df_comp["Actividad"]
+                       if any(p.get(a, 0) or e.get(a, 0) for p, e in datos_semanas)]
+        pivote["Actividad"] = actividades
+        for i, (a, b) in enumerate(semanas):
+            p, e = datos_semanas[i]
+            pivote[f"S{i + 1} ({a:%d}–{b:%d})"] = [f"{e.get(act, 0.0):.2f} / {p.get(act, 0.0):.2f}" for act in actividades]
+        if actividades:
+            st.dataframe(pd.DataFrame(pivote), hide_index=True, width="stretch")
+        else:
+            st.caption("Sin planificación ni ejecución registradas en este mes.")
+
+    elif vista == "Mensual":
+        ejecutado = ejecutado_por_actividad(anio, mes)
+        meta_anual = meta_anual_por_actividad(df_plan, anio, mes)
+        df_comp = tabla_plan_vs_ejecutado(plan_actual, ejecutado, unidad_actual, extra={"Meta Anual": meta_anual})
+        st.dataframe(df_comp, hide_index=True, width="stretch")
+
+    else:
+        ciclo = _ciclo_anual(anio, mes)
+        desde = date(ciclo[0][0], 9, 1)
+        hasta = date(ciclo[-1][0], 8, 31)
+        corte = min(max(hoy.date(), desde), hasta)
+        st.caption(
+            f"Ciclo {desde:%m/%Y} – {hasta:%m/%Y}. «Planificado a la fecha» = plan acumulado hasta el "
+            f"{corte:%d/%m/%Y}; el Avance % compara lo ejecutado contra eso. «% de la Meta» = ejecutado / meta anual."
+        )
+        meta_anual = plan_por_rango(df_plan, desde, hasta)
+        ejecutado = ejecutado_por_rango(desde, corte)
+        unidades_ciclo = {}
+        if not df_plan.empty:
+            unidades_ciclo = dict(zip(df_plan["Actividad"], df_plan["Unidad"]))
+        df_comp = tabla_plan_vs_ejecutado(plan_por_rango(df_plan, desde, corte), ejecutado,
+                                          unidades_ciclo, extra={"Meta Anual": meta_anual})
+        df_comp = df_comp.rename(columns={"Planificado": "Planificado a la fecha"})
+        df_comp["% de la Meta"] = [
+            round(e / m * 100, 1) if m > 0 else 0.0 for e, m in zip(df_comp["Ejecutado"], df_comp["Meta Anual"])
+        ]
+        st.dataframe(df_comp, hide_index=True, width="stretch")
+        df_comp = df_comp.rename(columns={"Planificado a la fecha": "Planificado"})
+
+    grafico = grafico_avance(df_comp)
+    if grafico is not None:
+        st.markdown("##### Avance por actividad")
+        st.altair_chart(grafico, width="stretch")
 
 def page_dashboard_durmientes():
     app_header("Control de Durmientes", back_page="Inicio")
@@ -2565,17 +3456,24 @@ def page_dashboard_durmientes():
     c2.metric("Cumplen", resumen["cumplen"])
     c3.metric("No cumplen", resumen["no_cumplen"])
     c4.metric("% cumplimiento", f"{resumen['pct_cumplimiento']:.0f}%")
+    st.caption("% cumplimiento sobre colleras evaluables (Cumple + No Cumple). 'No cumplen' incluye 'No Cumple (racha)'.")
+    d1, d2, d3, d4, d5 = st.columns(5)
+    d1.metric("Buenos", resumen["total_buenos"])
+    d2.metric("Malos", resumen["total_malos"])
+    d3.metric("Nuevos", resumen["total_nuevos"])
+    d4.metric("Reempl.", resumen["total_reempl"])
+    d5.metric("% renov.", f"{resumen['pct_renov_global']:.1f}%")
 
     st.divider()
     st.markdown("#### Distribución de colleras")
     df_torta = pd.DataFrame({
-        "Estado": ["Cumple", "No Cumple", "Sin Inspeccionar"],
+        "Estado": ["Cumple", "No Cumple", "Sin datos suficientes"],
         "Colleras": [resumen["cumplen"], resumen["no_cumplen"], resumen["sin_datos"]],
     })
     grafico_torta = alt.Chart(df_torta).mark_arc(innerRadius=60).encode(
         theta=alt.Theta("Colleras:Q"),
         color=alt.Color("Estado:N", scale=alt.Scale(
-            domain=["Cumple", "No Cumple", "Sin Inspeccionar"],
+            domain=["Cumple", "No Cumple", "Sin datos suficientes"],
             range=["#2FA84F", "#DC3545", "#B0B5BB"],
         ), legend=alt.Legend(title=None)),
         tooltip=["Estado:N", "Colleras:Q"],
@@ -2666,46 +3564,34 @@ def page_control_colleras():
     if st.button("💾 Guardar cambios de este PK", key="btn_guardar_control_colleras", width="stretch"):
         fecha_str = datetime.now().strftime("%Y-%m-%d")
         reporte_ajuste = f"AJUSTE-MANUAL-{st.session_state.usuario}"
-        filas_nuevas = []
-        for _, fila in df_editado.iterrows():
-            collera_id = fila["Collera"]
-            for pos in range(1, 24):
-                estado_nuevo = fila.get(f"D{pos}") or ""
-                if not estado_nuevo:
-                    continue
-                if not df_vigente.empty:
-                    anterior = df_vigente[(df_vigente["ColleraID"] == collera_id) & (df_vigente["Posicion"] == pos)]
-                else:
-                    anterior = df_vigente
-                estado_previo = anterior.iloc[0]["Estado"] if not anterior.empty else None
-                if estado_nuevo == estado_previo:
-                    continue
-                filas_nuevas.append({
-                    "ColleraID": collera_id, "Posicion": pos, "Estado": estado_nuevo,
-                    "FechaActualizacion": fecha_str, "ReporteID": reporte_ajuste,
-                })
-        if filas_nuevas:
-            st.session_state.durmientes_estado = pd.concat(
-                [st.session_state.durmientes_estado, pd.DataFrame(filas_nuevas)], ignore_index=True)
-            save_all_durmientes_estado()
+        secuencias = {
+            fila["Collera"]: [v if isinstance(v, str) and v else None for v in (fila.get(f"D{p}") for p in range(1, 24))]
+            for _, fila in df_editado.iterrows()
+        }
+        filas_nuevas = filas_cambios_durmientes(reporte_ajuste, fecha_str, secuencias)
+        if not filas_nuevas:
+            st.info("No hay cambios nuevos que guardar.")
+        elif guardar_bloques({"DurmientesEstado": filas_nuevas}):
+            persistir_cambios_durmientes_local(filas_nuevas)
             st.success(f"{len(filas_nuevas)} cambio(s) guardado(s) ✅")
             st.rerun()
         else:
-            st.info("No hay cambios nuevos que guardar.")
+            st.error("No se pudo guardar en Google Sheets. Tus cambios siguen en la tabla: intenta de nuevo.")
 
     st.divider()
     st.markdown("#### Resumen del PK")
-    df_vigente_actualizado = _estado_vigente(st.session_state.durmientes_estado)
+    st.caption("Mismas columnas que la hoja 'Control Durmientes' del Excel.")
+    estados = _estados_por_collera(_estado_vigente(st.session_state.durmientes_estado))
     filas_resumen = []
     for _, c in colleras_pk.iterrows():
-        ev = evaluar_collera(c["ColleraID"], c["Ubicacion"], df_vigente_actualizado)
+        ev = evaluar_collera(c["ColleraID"], c["Ubicacion"], estados_por_collera=estados)
         filas_resumen.append({
             "Collera": c["ColleraID"], "Ubicación": c["Ubicacion"],
-            "Registrado": ev["total_registrado"], "Buenos": ev["n_buenos"], "Malos": ev["n_malos"],
-            "Nuevos": ev["n_nuevos"], "Reemplazados": ev["n_reempl"], "Efectivos": ev["efectivos"],
-            "% Renovación": round(ev["pct_renovacion"] * 100, 1), "Racha Máx. Malo": ev["racha_max"],
-            "Mínimo Efectivo": "Sí" if ev["efectivos"] >= 10 else "No",
-            "Estado General": ev["estado_general"],
+            "TOTAL REGISTRADO": ev["total_registrado"], "N° BUENOS": ev["n_buenos"], "N° MALOS": ev["n_malos"],
+            "N° NUEVOS": ev["n_nuevos"], "N° REEMPL.": ev["n_reempl"], "EFECTIVOS (B+N+R)": ev["efectivos"],
+            "% RENOV. (N+R)": round(ev["pct_renovacion"] * 100, 1),
+            "MÍN. EFECTIVOS": ev["min_efectivos"], "RACHA CONSEC.": ev["racha_consec"],
+            "Racha máx. Malo": ev["racha_max"], "ESTADO GENERAL": ev["estado_general"],
         })
     st.dataframe(pd.DataFrame(filas_resumen), hide_index=True, width="stretch")
 
@@ -2732,6 +3618,32 @@ def flujo_validador():
         st.rerun()
     render_pie_desarrollador()
     bottom_nav([("Inicio", "🏠"), ("Crear Aviso", "➕"), ("Backlog", "📋"), ("OTs", "🔧")])
+
+# -------------------------
+# Botón Atrás/Adelante del navegador
+# -------------------------
+_nav_historial = components.declare_component(
+    "nav_historial", path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "nav_historial"))
+
+def sincronizar_historial_navegador():
+    """Cada pantalla queda como una entrada del historial del navegador, así el botón
+    Atrás/Adelante (o el gesto de volver del celular) lleva a la pantalla anterior en vez
+    de salir de la app. El componente avisa la pantalla elegida con un valor {pagina, t};
+    se lee desde session_state ANTES de dibujar nada, para que el componente reciba ya la
+    pantalla nueva y no la vuelva a apilar en el historial."""
+    valor = st.session_state.get("nav_historial")
+    if isinstance(valor, dict) and valor.get("pagina") and valor.get("t") != st.session_state.get("nav_historial_t"):
+        st.session_state.nav_historial_t = valor.get("t")
+        st.session_state.page = valor["pagina"]
+    # Contenedor fijo al inicio: el componente conserva siempre la misma posición y no se
+    # vuelve a crear en cada cambio de pantalla (si se recreara, perdería el historial).
+    with st.container(key="nav_historial_box"):
+        try:
+            _nav_historial(pagina=st.session_state.page, key="nav_historial", default=None)
+        except Exception:
+            pass  # sin el componente la app funciona igual, solo sin botón Atrás
+
+sincronizar_historial_navegador()
 
 # -------------------------
 # Enrutamiento por perfil

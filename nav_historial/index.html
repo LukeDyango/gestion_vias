@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="margin:0">
+<script>
+// Conecta las pantallas de la app con el historial del navegador (botón Atrás/Adelante).
+// - Cada vez que la app muestra otra pantalla, se agrega una entrada al historial.
+// - Al presionar Atrás/Adelante, se le avisa a la app a qué pantalla volver, SIN recargar
+//   la página (recargar cerraría la sesión).
+// La URL lleva la pantalla después de '#': con '#' Streamlit no reinicia la app por su
+// cuenta al cambiar el historial, así que la navegación la controla solo este componente.
+(function () {
+  const padre = window.parent;
+  let paginaActual = null;
+
+  function enviar(tipo, datos) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: tipo }, datos), "*");
+  }
+
+  function urlCon(pagina) {
+    return padre.location.pathname + padre.location.search + "#" + encodeURIComponent(pagina);
+  }
+
+  function alCambiarHistorial(evento) {
+    const estado = evento.state || {};
+    let pagina = estado.paginaApp;
+    if (!pagina && padre.location.hash.length > 1) {
+      pagina = decodeURIComponent(padre.location.hash.substring(1));
+    }
+    if (!pagina || pagina === paginaActual) return;
+    paginaActual = pagina;
+    enviar("streamlit:setComponentValue", { value: { pagina: pagina, t: Date.now() }, dataType: "json" });
+  }
+
+  window.addEventListener("message", function (evento) {
+    const datos = evento.data || {};
+    if (datos.type !== "streamlit:render") return;
+    const pagina = (datos.args || {}).pagina;
+    if (!pagina) return;
+    try {
+      if (paginaActual === null) {
+        // Primera vez: registra la pantalla inicial sin crear otra entrada.
+        padre.history.replaceState({ paginaApp: pagina }, "", urlCon(pagina));
+        // Si el componente se volvió a crear (p.ej. tras cerrar sesión y volver a entrar),
+        // se quita el listener del componente anterior para no avisar dos veces.
+        if (padre.__navHistorialApp) padre.removeEventListener("popstate", padre.__navHistorialApp);
+        padre.__navHistorialApp = alCambiarHistorial;
+        padre.addEventListener("popstate", alCambiarHistorial);
+      } else if (pagina !== paginaActual) {
+        padre.history.pushState({ paginaApp: pagina }, "", urlCon(pagina));
+      }
+      paginaActual = pagina;
+    } catch (e) {
+      // Si el navegador no permite acceder a la ventana principal, la app sigue funcionando sin esto.
+    }
+  });
+
+  enviar("streamlit:componentReady", { apiVersion: 1 });
+  enviar("streamlit:setFrameHeight", { height: 0 });
+})();
+</script>
+</body>
+</html>
