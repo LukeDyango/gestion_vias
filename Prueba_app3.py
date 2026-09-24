@@ -248,15 +248,40 @@ def _valores_hoja_sheets_directo(nombre_hoja: str) -> list:
         raise
     return resp.get("values", [])
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _titulos_hojas() -> list:
+    """Nombres de las pestañas que existen en el Sheet (cambian muy rara vez)."""
+    sh = _cliente_sheets()
+    if sh is None:
+        raise RuntimeError("Google Sheets no está configurado")
+    return [ws.title for ws in sh.worksheets()]
+
 @st.cache_data(ttl=60, show_spinner=False)
+def _todas_las_hojas() -> dict:
+    """TODAS las hojas de datos de la app en UNA sola llamada a Google (~0,4 s), en vez de
+    una llamada por hoja (~0,4 s cada una: una pantalla con 3 hojas tardaba más de 1 s, y
+    lo volvía a pagar cada vez que vencía la caché). Caché compartida entre usuarios, 60 s;
+    se invalida apenas la app escribe algo. FotosData (pesada) no se incluye."""
+    sh = _cliente_sheets()
+    if sh is None:
+        raise RuntimeError("Google Sheets no está configurado")
+    existentes = set(_titulos_hojas())
+    nombres = [n for n in REPORTES_SHEETS if n in existentes]
+    resp = sh.values_batch_get([f"'{n}'" for n in nombres], params={"valueRenderOption": "UNFORMATTED_VALUE"})
+    return {n: vr.get("values", []) for n, vr in zip(nombres, resp.get("valueRanges", []))}
+
 def _valores_hoja_sheets(nombre_hoja: str) -> list:
-    """Versión con caché (compartida entre usuarios, 60 s) de _valores_hoja_sheets_directo:
-    evita volver a pedirle a Google cada hoja en cada interacción de cada usuario (la API
-    permite ~60 lecturas por minuto). Se invalida apenas la app escribe algo en Sheets."""
+    """Valores de una hoja desde la lectura conjunta en caché. Si la pestaña todavía no
+    existe (p.ej. InspeccionColleras antes de la primera collera), se trata como vacía: se
+    crea recién al escribir (_asegurar_hoja)."""
+    if nombre_hoja in REPORTES_SHEETS:
+        datos = _todas_las_hojas()
+        return datos.get(nombre_hoja) or [REPORTES_SHEETS[nombre_hoja]]
     return _valores_hoja_sheets_directo(nombre_hoja)
 
 def _invalidar_cache_sheets():
-    _valores_hoja_sheets.clear()
+    _todas_las_hojas.clear()
+    _titulos_hojas.clear()
 
 def _fecha_desde_serial(valor):
     """Las filas guardadas por versiones antiguas de la app (modo USER_ENTERED) quedaron
@@ -519,11 +544,20 @@ def evaluar_collera(collera_id: str, ubicacion: str, df_estado_vigente: pd.DataF
     return evaluar_secuencia([estados.get(p) for p in range(1, 24)], ubicacion)
 
 def _evaluar_todas_colleras() -> list:
-    """[(fila del catálogo, evaluación)] de las 2404 colleras con el estado vigente."""
+    """[(fila del catálogo, evaluación)] de las 2404 colleras con el estado vigente. Se
+    calcula una sola vez mientras el historial no cambie (antes la pantalla Durmientes lo
+    calculaba dos veces por cada clic)."""
+    df_estado = st.session_state.durmientes_estado
+    firma = (len(df_estado), tuple(df_estado.iloc[-1].astype(str)) if len(df_estado) else ())
+    memo = st.session_state.get("_memo_eval_colleras")
+    if memo and memo[0] == firma:
+        return memo[1]
     df_colleras = cargar_todas_colleras()
-    estados = _estados_por_collera(_estado_vigente(st.session_state.durmientes_estado))
-    return [(row, evaluar_collera(row["ColleraID"], row["Ubicacion"], estados_por_collera=estados))
-            for _, row in df_colleras.iterrows()]
+    estados = _estados_por_collera(_estado_vigente(df_estado))
+    resultado = [(row, evaluar_collera(row["ColleraID"], row["Ubicacion"], estados_por_collera=estados))
+                 for _, row in df_colleras.iterrows()]
+    st.session_state._memo_eval_colleras = (firma, resultado)
+    return resultado
 
 def resumen_global_durmientes() -> dict:
     resultados = [ev for _, ev in _evaluar_todas_colleras()]
