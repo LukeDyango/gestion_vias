@@ -2291,11 +2291,6 @@ def render_login():
     counter = st.session_state.login_form_counter
     usuario_input = st.text_input("Usuario", key=f"login_usuario_{counter}")
     password_input = st.text_input("Contraseña", type="password", key=f"login_password_{counter}")
-    recordar = st.checkbox(f"Mantener la sesión iniciada en este celular ({HORAS_SESION_RECORDADA} h)",
-                           value=True, key="login_recordar",
-                           help="Si la página se cae o se reinicia, vuelves a entrar sin escribir la contraseña. "
-                                "No lo marques en un equipo compartido.")
-
     if st.button("Ingresar", key="btn_login"):
         usuarios = cargar_usuarios()
         if not usuarios:
@@ -2304,7 +2299,7 @@ def render_login():
             clave = usuario_input.strip().lower()
             cuenta = usuarios.get(clave)
             if cuenta and password_input == cuenta["password"] and cuenta["perfil"] in PERFILES:
-                iniciar_sesion(clave, cuenta, recordar)
+                iniciar_sesion(clave, cuenta, recordar=True)  # siempre recordada 12 h (sin casilla visible)
                 st.rerun()
             else:
                 st.session_state.login_form_counter += 1
@@ -2619,10 +2614,8 @@ def page_control_durmientes_terreno():
     app_header("Control de Durmientes", back_page="Inicio")
     perfil_bar()
     st.caption(
-        "Igual que la hoja A4 del PK: elige el PK y ve marcando cada collera (D1 a D23). Puedes "
-        "ir y volver entre colleras sin perder lo marcado. **Cada collera se guarda sola al "
-        "completar sus 23 durmientes.** Norma NS-01-01-00: mínimo 10 efectivos y racha "
-        "máxima de 'Malo' seguidos (2 en curva, 3 en recta)."
+        "Elige el PK y marca cada collera (D1 a D23). **Cada collera se guarda sola al "
+        "completar sus 23 durmientes.**"
     )
 
     # Streamlit borra el valor de los widgets al salir de la pantalla: se recuerda aparte
@@ -2718,7 +2711,7 @@ def page_control_durmientes_terreno():
     badge(ev["estado_general"], TIPO_BADGE_ESTADO.get(ev["estado_general"], "info"))
     st.dataframe(tabla_indicadores_collera(ev), hide_index=True, width="stretch")
 
-    with st.expander(f"📋 Resumen del PK {pk} (como la hoja A4)"):
+    with st.expander(f"📋 Resumen del PK {pk}"):
         filas = []
         for cid in ids:
             c = por_id[cid]
