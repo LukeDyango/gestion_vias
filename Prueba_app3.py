@@ -9,6 +9,9 @@ import base64
 import uuid
 import zipfile
 import time
+import hmac
+import hashlib
+import traceback
 import numbers
 import calendar
 from datetime import datetime, date, timedelta
@@ -74,12 +77,14 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
     background: #2FA84F !important; color: #fff !important; border: none !important;
 }
 .st-key-btn_generar_reporte button { background: #0B3B8A !important; color: #fff !important; border: none !important; }
-.st-key-btn_add_trabajo button, .st-key-btn_add_equipo_otro button, .st-key-btn_add_material button, .st-key-btn_add_collera button,
+.st-key-btn_add_trabajo button, .st-key-btn_add_equipo_otro button, .st-key-btn_add_material button, .st-key-btn_ir_control_durmientes button,
 .st-key-btn_add_trabajador button { background: #F1F3F6 !important; color: #0B3B8A !important; border: 1px dashed #0B3B8A !important; }
 .st-key-btn_backlog_avisos button { background: #0B3B8A !important; color: #fff !important; border: none !important; text-align: left !important; }
 .st-key-btn_backlog_ots button { background: #3D7DD9 !important; color: #fff !important; border: none !important; text-align: left !important; }
 .st-key-btn_reportes button, .st-key-btn_backup_reportes button, .st-key-btn_preparar_respaldo button { background: #F1F3F6 !important; color: #333 !important; border: 1px solid #dcdfe4 !important; text-align: left !important; }
 .st-key-btn_mis_avisos button { background: #0B3B8A !important; color: #fff !important; border: none !important; text-align: left !important; }
+.st-key-btn_control_durmientes_terreno button { background: #2FA84F !important; color: #fff !important; border: none !important; text-align: left !important; }
+.st-key-cd_siguiente button { background: #0B3B8A !important; color: #fff !important; border: none !important; }
 .st-key-btn_mis_reportes button { background: #3D7DD9 !important; color: #fff !important; border: none !important; text-align: left !important; }
 .st-key-btn_rechazar button { background: #DC3545 !important; color: #fff !important; border: none !important; }
 .st-key-btn_observar button { background: #E0A458 !important; color: #fff !important; border: none !important; }
@@ -563,22 +568,23 @@ def resumen_por_pk() -> list:
                       "No cumplen": n_no_cumplen, "Estado KM": estado_km})
     return filas
 
-# Columnas de la foto de cada inspección de collera hecha en un Reporte Diario: la misma
-# fila que la hoja 'Control Durmientes' del Excel (D1..D23 + columnas calculadas).
+# Columnas de la foto de cada inspección de collera (pantalla Control de Durmientes): la
+# misma fila que la hoja 'Control Durmientes' del Excel (D1..D23 + columnas calculadas),
+# más quién la registró. El Reporte Diario de ese día/usuario las incluye en su PDF/Excel.
 INSPECCION_COLUMNS = (
     ["ReporteID", "Fecha", "ColleraID", "PK", "Collera", "Ubicacion"]
     + [f"D{p}" for p in range(1, 24)]
     + ["TotalRegistrado", "Buenos", "Malos", "Nuevos", "Reemplazados", "Efectivos",
-       "PctRenovacion", "MinEfectivos", "RachaConsec", "EstadoGeneral"]
+       "PctRenovacion", "MinEfectivos", "RachaConsec", "EstadoGeneral", "Usuario"]
 )
 
-def fila_inspeccion(reporte_id: str, fecha_str: str, collera: dict, secuencia: list) -> list:
+def fila_inspeccion(reporte_id: str, fecha_str: str, collera: dict, secuencia: list, usuario: str = "") -> list:
     ev = evaluar_secuencia(secuencia, collera["Ubicacion"])
     return ([reporte_id, fecha_str, collera["ColleraID"], int(collera["PK"]), int(collera["Collera"]), collera["Ubicacion"]]
             + [e or "" for e in secuencia]
             + [ev["total_registrado"], ev["n_buenos"], ev["n_malos"], ev["n_nuevos"], ev["n_reempl"],
                ev["efectivos"], round(ev["pct_renovacion"], 4), ev["min_efectivos"], ev["racha_consec"],
-               ev["estado_general"]])
+               ev["estado_general"], usuario])
 
 def filas_cambios_durmientes(reporte_id: str, fecha_str: str, secuencias: dict) -> list:
     """Filas nuevas para el historial DurmientesEstado: {ColleraID: [23 estados]}. Solo
@@ -1725,7 +1731,7 @@ def resumen_desde_historico(reporte_id: str) -> dict | None:
         "ubicacion": _txt(rep.get("Ubicacion")), "observaciones": _txt(rep.get("Observaciones")),
         "trabajos": trabajos, "equipos": equipos, "materiales": materiales,
         "asistencia": asistencia, "fotos": fotos,
-        "colleras": colleras_desde_inspecciones(_de("InspeccionColleras")),
+        "colleras": colleras_desde_inspecciones(inspecciones_filtradas(fecha, str(_txt(rep["Usuario"])), str(reporte_id))),
         "total_hh": sum(t["hh"] for t in trabajos),
     }
 
@@ -1760,8 +1766,7 @@ def mostrar_detalle_reporte_diario(reporte_id: str):
     else:
         st.caption("Sin actividades registradas.")
 
-    df_insp = _leer_hoja_df("InspeccionColleras")
-    insp_rep = df_insp[df_insp["ReporteID"].astype(str) == str(reporte_id)] if not df_insp.empty else df_insp
+    insp_rep = inspecciones_filtradas(str(rep["Fecha"])[:10], str(rep["Usuario"]), str(reporte_id))
     if not insp_rep.empty:
         st.markdown("**🛤️ Control de Durmientes por Collera**")
         for c in colleras_desde_inspecciones(insp_rep):
@@ -1880,8 +1885,6 @@ def init_data():
         st.session_state.selected_aviso = None
     if "reporte_trabajos" not in st.session_state:
         st.session_state.reporte_trabajos = []
-    if "reporte_colleras" not in st.session_state:
-        st.session_state.reporte_colleras = []
     if "reporte_equipos_catalogo" not in st.session_state:
         st.session_state.reporte_equipos_catalogo = {nombre: {"usado": False, "cantidad": 1.0} for nombre in EQUIPOS_CATALOGO}
     if "reporte_equipos_otros" not in st.session_state:
@@ -1948,9 +1951,21 @@ def new_material_row():
     return {"id": new_row_id(), "nombre": MATERIALES_CATALOGO[0], "nombre_custom": "", "cantidad": 0.0,
             "estado": ESTADOS_MATERIAL[0]}
 
+def recordar_widget(clave: str, por_defecto=None, clave_mem: str | None = None):
+    """Antes de dibujar un widget: si Streamlit borró su valor (se salió de la pantalla, o
+    la sesión es nueva tras una caída), lo repone desde su copia *_mem."""
+    if clave not in st.session_state:
+        valor = st.session_state.get(clave_mem or f"{clave}_mem", por_defecto)
+        if valor is not None:
+            st.session_state[clave] = valor
+
+def memorizar_widget(clave_mem: str, valor):
+    st.session_state[clave_mem] = valor
+
 def reset_reporte_form():
+    for campo in ("rep_fecha", "rep_observaciones", "rep_ubicacion_texto"):
+        st.session_state.pop(f"{campo}_mem", None)  # el Grupo Vía y el modo de ubicación se mantienen
     st.session_state.reporte_trabajos = []
-    st.session_state.reporte_colleras = []
     st.session_state.reporte_equipos_catalogo = {nombre: {"usado": False, "cantidad": 1.0} for nombre in EQUIPOS_CATALOGO}
     st.session_state.reporte_equipos_otros = []
     st.session_state.reporte_materiales = []
@@ -2019,8 +2034,7 @@ def perfil_bar():
         st.caption(f"Perfil: **{st.session_state.perfil}** · {st.session_state.usuario}")
     with c2:
         if st.button("Salir", key="btn_salir"):
-            st.session_state.perfil = None
-            st.session_state.page = "Inicio"
+            cerrar_sesion()
             st.rerun()
 
 def render_pie_desarrollador():
@@ -2101,23 +2115,196 @@ def cargar_usuarios() -> dict:
             }
     return usuarios
 
+# -------------------------
+# Sesión recordada en el celular (12 h): token firmado, guardado en el navegador.
+# Si la página se cae o Streamlit se reinicia, al volver a abrirla entra solo, sin pedir
+# usuario y contraseña. La firma usa las contraseñas de Secrets (o [app] clave_sesion si
+# existe): cambiar contraseñas invalida todas las sesiones recordadas.
+# -------------------------
+HORAS_SESION_RECORDADA = 12
+
+def _clave_firma_sesion() -> bytes:
+    try:
+        base = str(st.secrets["app"]["clave_sesion"])
+    except Exception:
+        base = json.dumps(sorted((u, c["password"]) for u, c in cargar_usuarios().items()))
+    return hashlib.sha256(("gestion_vias|sesion|" + base).encode("utf-8")).digest()
+
+def crear_token_sesion(clave_usuario: str) -> str:
+    carga = base64.urlsafe_b64encode(json.dumps(
+        {"u": clave_usuario, "exp": int(time.time()) + HORAS_SESION_RECORDADA * 3600}).encode("utf-8")).decode("ascii")
+    firma = hmac.new(_clave_firma_sesion(), carga.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{carga}.{firma}"
+
+def validar_token_sesion(token) -> str | None:
+    """Devuelve la clave de usuario si el token es auténtico y no venció; si no, None."""
+    try:
+        carga, firma = str(token).split(".", 1)
+        esperada = hmac.new(_clave_firma_sesion(), carga.encode("ascii"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(firma, esperada):
+            return None
+        datos = json.loads(base64.urlsafe_b64decode(carga.encode("ascii")))
+        return datos["u"] if int(datos["exp"]) > time.time() else None
+    except Exception:
+        return None
+
+def iniciar_sesion(clave_usuario: str, cuenta: dict, recordar: bool):
+    st.session_state.perfil = cuenta["perfil"]
+    st.session_state.usuario = cuenta["nombre"]
+    st.session_state.page = "Inicio"
+    st.session_state.sesion_token = crear_token_sesion(clave_usuario) if recordar else None
+    restaurar_borradores_usuario()
+
+def cerrar_sesion():
+    st.session_state.perfil = None
+    st.session_state.page = "Inicio"
+    st.session_state.sesion_token = None  # «Salir» también olvida la sesión recordada
+
+# -------------------------
+# Borradores guardados en el celular (localStorage del navegador)
+# Lo que aún no se guarda en Google Sheets -- colleras a medio marcar, Reporte Diario a
+# medio llenar, pantalla actual -- se copia al navegador en cada interacción. Si la página
+# se cae, se recarga o Streamlit se reinicia, al volver se recupera. Es por celular y por
+# usuario (varias cuentas en el mismo celular no se mezclan). Las fotos no se guardan
+# (el navegador no permite guardar archivos así): hay que volver a adjuntarlas.
+# -------------------------
+_almacen_local = components.declare_component(
+    "almacen_local", path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "almacen_local"))
+
+# Campos del formulario del Reporte Diario que viven en widgets (se recuerdan en *_mem).
+CAMPOS_REPORTE_MEM = ["rep_grupo_via", "rep_fecha", "rep_observaciones", "rep_ubicacion_modo", "rep_ubicacion_texto"]
+
+def _a_json(valor):
+    if isinstance(valor, (date, datetime)):
+        return {"__fecha__": valor.isoformat()[:10]}
+    if isinstance(valor, dict):
+        return {str(k): _a_json(v) for k, v in valor.items()}
+    if isinstance(valor, (list, tuple)):
+        return [_a_json(v) for v in valor]
+    if isinstance(valor, (str, int, float, bool)) or valor is None:
+        return valor
+    return str(valor)
+
+def _desde_json(valor):
+    if isinstance(valor, dict):
+        if set(valor) == {"__fecha__"}:
+            try:
+                return date.fromisoformat(valor["__fecha__"])
+            except ValueError:
+                return None
+        return {k: _desde_json(v) for k, v in valor.items()}
+    if isinstance(valor, list):
+        return [_desde_json(v) for v in valor]
+    return valor
+
+def _foto_borradores() -> dict:
+    """Todo lo que todavía no está en Google Sheets, para copiarlo al navegador."""
+    ss = st.session_state
+    return _a_json({
+        "page": ss.get("page"),
+        "guardado": now_str(),
+        "reporte": {
+            "trabajos": ss.get("reporte_trabajos", []),
+            "equipos_catalogo": ss.get("reporte_equipos_catalogo", {}),
+            "equipos_otros": ss.get("reporte_equipos_otros", []),
+            "materiales": ss.get("reporte_materiales", []),
+            "asistencia": ss.get("reporte_asistencia", []),
+            "ubicacion_gps": ss.get("rep_ubicacion_gps", ""),
+            "campos": {c: ss.get(f"{c}_mem") for c in CAMPOS_REPORTE_MEM},
+        },
+        "control_durmientes": {
+            "borradores": ss.get("cd_borradores", {}),
+            "pk": ss.get("cd_pk_mem"), "sel": ss.get("cd_sel_mem"), "fecha": ss.get("cd_fecha_mem"),
+        },
+    })
+
+def restaurar_borradores_usuario():
+    """Recupera los borradores guardados en el celular para el usuario que acaba de entrar."""
+    datos = (st.session_state.get("almacen_datos") or {}).get("usuarios", {}).get(st.session_state.get("usuario"))
+    if not datos or st.session_state.get("borradores_restaurados_de") == st.session_state.get("usuario"):
+        return
+    st.session_state.borradores_restaurados_de = st.session_state.usuario
+    datos = _desde_json(datos)
+    rep = datos.get("reporte") or {}
+    for clave, valor in (("reporte_trabajos", rep.get("trabajos")), ("reporte_equipos_otros", rep.get("equipos_otros")),
+                         ("reporte_materiales", rep.get("materiales")), ("reporte_asistencia", rep.get("asistencia"))):
+        if isinstance(valor, list):
+            st.session_state[clave] = valor
+    if isinstance(rep.get("equipos_catalogo"), dict):
+        st.session_state.reporte_equipos_catalogo.update(
+            {k: v for k, v in rep["equipos_catalogo"].items() if k in st.session_state.reporte_equipos_catalogo})
+    st.session_state.rep_ubicacion_gps = rep.get("ubicacion_gps") or ""
+    for campo, valor in (rep.get("campos") or {}).items():
+        if valor is not None:
+            st.session_state[f"{campo}_mem"] = valor
+    cd = datos.get("control_durmientes") or {}
+    if isinstance(cd.get("borradores"), dict):
+        st.session_state.cd_borradores = {k: (list(v) + [None] * 23)[:23] for k, v in cd["borradores"].items() if isinstance(v, list)}
+    for campo in ("pk", "sel", "fecha"):
+        if cd.get(campo) is not None:
+            st.session_state[f"cd_{campo}_mem"] = cd[campo]
+    if datos.get("page"):
+        st.session_state.page = datos["page"]
+    hay_algo = rep.get("trabajos") or any(any(v) for v in st.session_state.get("cd_borradores", {}).values())
+    if hay_algo:
+        st.session_state.aviso_borradores = f"Se recuperó lo que tenías sin guardar (copia del {datos.get('guardado', '')})."
+
+def procesar_almacen_local():
+    """Primera vez que llega lo guardado en el navegador en esta sesión: entra solo si hay
+    una sesión recordada válida y recupera los borradores."""
+    if st.session_state.get("almacen_restaurado"):
+        return
+    valor = st.session_state.get("almacen_local")
+    if not isinstance(valor, dict):
+        return  # todavía no llega (el componente responde apenas se dibuja)
+    cargado = valor.get("cargado") if isinstance(valor.get("cargado"), dict) else {}
+    st.session_state.almacen_datos = {"sesion": cargado.get("sesion"),
+                                      "usuarios": cargado.get("usuarios") if isinstance(cargado.get("usuarios"), dict) else {}}
+    st.session_state.almacen_restaurado = True
+    if st.session_state.perfil is None:
+        clave = validar_token_sesion((cargado.get("sesion") or {}).get("token"))
+        cuenta = cargar_usuarios().get(clave) if clave else None
+        if cuenta and cuenta["perfil"] in PERFILES:
+            st.session_state.perfil = cuenta["perfil"]
+            st.session_state.usuario = cuenta["nombre"]
+            st.session_state.sesion_token = cargado["sesion"]["token"]
+    if st.session_state.perfil is not None:
+        restaurar_borradores_usuario()
+
+def sincronizar_almacen_local():
+    datos = None
+    if st.session_state.get("almacen_restaurado"):
+        datos = st.session_state.almacen_datos
+        token = st.session_state.get("sesion_token")
+        datos["sesion"] = {"token": token} if token and st.session_state.perfil else None
+        if st.session_state.perfil:
+            datos.setdefault("usuarios", {})[st.session_state.usuario] = _foto_borradores()
+    try:
+        _almacen_local(datos=datos, restaurado=bool(st.session_state.get("almacen_restaurado")),
+                       key="almacen_local", default=None)
+    except Exception:
+        pass  # sin almacenamiento del navegador la app funciona igual
+
 def render_login():
     app_header("Bienvenido")
     st.caption("Ingresa con tu usuario y contraseña.")
     counter = st.session_state.login_form_counter
     usuario_input = st.text_input("Usuario", key=f"login_usuario_{counter}")
     password_input = st.text_input("Contraseña", type="password", key=f"login_password_{counter}")
+    recordar = st.checkbox(f"Mantener la sesión iniciada en este celular ({HORAS_SESION_RECORDADA} h)",
+                           value=True, key="login_recordar",
+                           help="Si la página se cae o se reinicia, vuelves a entrar sin escribir la contraseña. "
+                                "No lo marques en un equipo compartido.")
 
     if st.button("Ingresar", key="btn_login"):
         usuarios = cargar_usuarios()
         if not usuarios:
             st.error("Todavía no se configuraron los usuarios de esta app. Avisa al administrador.")
         else:
-            cuenta = usuarios.get(usuario_input.strip().lower())
+            clave = usuario_input.strip().lower()
+            cuenta = usuarios.get(clave)
             if cuenta and password_input == cuenta["password"] and cuenta["perfil"] in PERFILES:
-                st.session_state.perfil = cuenta["perfil"]
-                st.session_state.usuario = cuenta["nombre"]
-                st.session_state.page = "Inicio"
+                iniciar_sesion(clave, cuenta, recordar)
                 st.rerun()
             else:
                 st.session_state.login_form_counter += 1
@@ -2125,7 +2312,14 @@ def render_login():
 
     st.markdown("<div style='text-align:center;opacity:.5;padding-top:10px;'>sacyr</div>", unsafe_allow_html=True)
 
+# Contenedor fijo al inicio de la página: los componentes invisibles (almacenamiento del
+# navegador e historial Atrás/Adelante) conservan siempre la misma posición y no se recrean.
+_caja_componentes = st.container(key="nav_historial_box")
+procesar_almacen_local()
+
 if st.session_state.perfil is None:
+    with _caja_componentes:
+        sincronizar_almacen_local()
     render_login()
     st.stop()
 
@@ -2212,11 +2406,13 @@ def render_aviso_row(row):
 # =========================================================
 def render_captura_ubicacion() -> str:
     """Ubicación donde se hace el reporte: por GPS del celular o escrita a mano. Devuelve el texto final."""
+    recordar_widget("rep_ubicacion_modo")
     modo = st.radio(
         "¿Cómo quieres registrar la ubicación?",
         ["📍 Usar GPS del celular", "✏️ Escribir descripción"],
         key="rep_ubicacion_modo", horizontal=True,
     )
+    memorizar_widget("rep_ubicacion_modo_mem", modo)
 
     if modo == "📍 Usar GPS del celular":
         if st.session_state.rep_ubicacion_gps:
@@ -2235,10 +2431,14 @@ def render_captura_ubicacion() -> str:
             st.rerun()
         return ""
     else:
-        return st.text_input(
-            "Descripción de la ubicación", key=f"rep_ubicacion_texto_{st.session_state.ubicacion_texto_counter}",
+        clave = f"rep_ubicacion_texto_{st.session_state.ubicacion_texto_counter}"
+        recordar_widget(clave, clave_mem="rep_ubicacion_texto_mem")
+        texto = st.text_input(
+            "Descripción de la ubicación", key=clave,
             placeholder="Ej: Km 23.400, cerca de la estación Malloco...",
         )
+        memorizar_widget("rep_ubicacion_texto_mem", texto)
+        return texto
 
 def render_trabajos_section():
     if not st.session_state.reporte_trabajos:
@@ -2262,12 +2462,16 @@ def render_trabajos_section():
                 row["collera_desde_id"], row["collera_hasta_id"] = "", ""
             else:
                 opciones = [f"Collera {c['Collera']} (km {c['KmDesde']:.3f}–{c['KmHasta']:.3f})" for c in colleras_pk]
+                ids_pk = [c["ColleraID"] for c in colleras_pk]
+                # Al volver a la pantalla (o tras recuperar un borrador) se reabre con la collera ya elegida.
+                idx_desde_prev = ids_pk.index(row["collera_desde_id"]) if row.get("collera_desde_id") in ids_pk else 0
+                idx_hasta_prev = ids_pk.index(row["collera_hasta_id"]) if row.get("collera_hasta_id") in ids_pk else len(opciones) - 1
                 cA, cB = st.columns(2)
                 with cA:
-                    collera_desde = st.selectbox("Collera Desde", opciones, key=f"trab_coldesde_{rid}")
+                    collera_desde = st.selectbox("Collera Desde", opciones, index=idx_desde_prev, key=f"trab_coldesde_{rid}")
                 with cB:
                     collera_hasta = st.selectbox(
-                        "Collera Hasta", opciones, index=len(opciones) - 1, key=f"trab_colhasta_{rid}",
+                        "Collera Hasta", opciones, index=idx_hasta_prev, key=f"trab_colhasta_{rid}",
                     )
                 idx_desde = opciones.index(collera_desde)
                 idx_hasta = opciones.index(collera_hasta)
@@ -2288,36 +2492,23 @@ def render_trabajos_section():
             row["hombres"] = st.number_input("N° Trabajadores (Hombre)", min_value=0, value=int(row["hombres"]), step=1, key=f"trab_hom_{rid}")
 
             if row["actividad"] in ("Inspección Vía", "Reemplazo de Durmientes Común"):
-                st.caption("🛤️ Registra el estado de los durmientes en la sección **Control de Durmientes por Collera** (más abajo).")
+                st.caption("🛤️ El estado de los durmientes se registra en la pantalla **Control de Durmientes** (botón en Inicio).")
 
             if st.button("🗑 Eliminar actividad", key=f"trab_del_{rid}"):
                 st.session_state.reporte_trabajos = [r for r in st.session_state.reporte_trabajos if r["id"] != rid]
                 st.rerun()
 
 # -------------------------
-# Control de Durmientes por Collera (en el Reporte Diario, lo ingresa el Jefe de Grupo)
+# Control de Durmientes por Collera (pantalla propia del Jefe de Grupo, fuera del Reporte Diario)
+# En terreno se trabaja con una hoja A4 con TODAS las colleras del PK: se va y vuelve entre
+# colleras marcando. Por eso lo marcado se guarda en un borrador por collera (no en los
+# widgets, que Streamlit borra al dejar de mostrarse), y cada collera se guarda sola en
+# Sheets apenas tiene los 23 durmientes marcados.
 # -------------------------
 ETIQUETA_ESTADO = {"Bueno": "Bueno", "Malo": "Malo", "Nuevo": "Nuevo", "Reemplazado": "Reempl."}
 CUADRO_ESTADO = {"Bueno": "🟩", "Malo": "🟥", "Nuevo": "🟦", "Reemplazado": "🟪"}
 TIPO_BADGE_ESTADO = {"Cumple": "ok", "No Cumple": "bad", "No Cumple (racha)": "bad",
                      "Inspección Incompleta": "warn", "Sin Inspeccionar": "muted"}
-
-def new_collera_row():
-    return {"id": new_row_id(), "pk": 33}
-
-def _clave_durmiente(rid: str, collera_id: str, pos: int) -> str:
-    return f"durm_{rid}_{collera_id}_{pos}"
-
-def _completar_vacios(rid: str, collera_id: str, estado: str):
-    for pos in range(1, 24):
-        clave = _clave_durmiente(rid, collera_id, pos)
-        if not st.session_state.get(clave):
-            st.session_state[clave] = estado
-
-def _restaurar_vigente(rid: str, collera_id: str):
-    vigente = cargar_estado_collera(collera_id)
-    for pos in range(1, 24):
-        st.session_state[_clave_durmiente(rid, collera_id, pos)] = vigente.get(pos)
 
 def tabla_indicadores_collera(ev: dict) -> pd.DataFrame:
     """Los mismos indicadores de la hoja 'Control Durmientes' del Excel (columnas AA:AK)."""
@@ -2337,64 +2528,207 @@ def tabla_indicadores_collera(ev: dict) -> pd.DataFrame:
 def franja_durmientes(secuencia: list) -> str:
     return "".join(CUADRO_ESTADO.get(e, "⬜") for e in secuencia)
 
-def render_colleras_section():
+def inspecciones_filtradas(fecha_str: str | None = None, usuario: str | None = None,
+                           reporte_id: str | None = None) -> pd.DataFrame:
+    """Inspecciones de colleras (hoja InspeccionColleras) de un usuario en una fecha y/o
+    ligadas a un ReporteID. Si una collera se guardó más de una vez, queda la última."""
+    df = _leer_hoja_df("InspeccionColleras")
+    if df.empty:
+        return df
+    for col in ("ReporteID", "Usuario"):
+        if col not in df.columns:
+            df[col] = ""
+    mascara = pd.Series(False, index=df.index)
+    if reporte_id:
+        mascara |= df["ReporteID"].astype(str) == str(reporte_id)
+    if fecha_str and usuario:
+        mascara |= (df["Fecha"].astype(str).str[:10] == str(fecha_str)[:10]) & (df["Usuario"].astype(str) == str(usuario))
+    return df[mascara].drop_duplicates("ColleraID", keep="last")
+
+def _cd_clave(collera_id: str, pos: int) -> str:
+    return f"cd_{collera_id}_{pos}"
+
+def _cd_fecha_str() -> str:
+    fecha = st.session_state.get("cd_fecha") or st.session_state.get("cd_fecha_mem") or datetime.now().date()
+    return fecha.strftime("%Y-%m-%d")
+
+def _cd_borrador(collera_id: str) -> list:
+    return st.session_state.setdefault("cd_borradores", {}).setdefault(collera_id, [None] * 23)
+
+def _cd_guardadas_hoy() -> dict:
+    """{ColleraID: secuencia} de lo ya guardado por este usuario en la fecha elegida
+    (en Sheets, más lo guardado en esta sesión aunque la caché aún no lo muestre)."""
+    guardadas = {}
+    df = inspecciones_filtradas(_cd_fecha_str(), st.session_state.usuario)
+    for _, r in df.iterrows():
+        guardadas[str(r["ColleraID"])] = tuple(
+            (r.get(f"D{p}") if isinstance(r.get(f"D{p}"), str) and r.get(f"D{p}") else None) for p in range(1, 24))
+    guardadas.update(st.session_state.setdefault("cd_guardadas", {}).get(_cd_fecha_str(), {}))
+    return guardadas
+
+def _cd_guardar_collera(collera: dict, secuencia: list):
+    """Guarda una collera completa: foto de la inspección (InspeccionColleras) + cambios
+    del historial (DurmientesEstado), en una sola operación atómica."""
+    collera_id = collera["ColleraID"]
+    fecha_str = _cd_fecha_str()
+    usuario = st.session_state.usuario
+    filas_insp = [fila_inspeccion("", fecha_str, collera, secuencia, usuario)]
+    cambios = filas_cambios_durmientes(f"CONTROL {usuario}", fecha_str, {collera_id: secuencia})
+    if guardar_bloques({"InspeccionColleras": filas_insp, "DurmientesEstado": cambios}):
+        persistir_cambios_durmientes_local(cambios)
+        st.session_state.setdefault("cd_guardadas", {}).setdefault(fecha_str, {})[collera_id] = tuple(secuencia)
+        st.session_state.cd_mensaje = ("ok", f"Collera {collera['Collera']} guardada ✅")
+    else:
+        st.session_state.cd_mensaje = ("error", f"No se pudo guardar la collera {collera['Collera']} (sin conexión). "
+                                                "Lo marcado sigue acá; toca «Reintentar guardar».")
+
+def _cd_autoguardar(collera: dict):
+    # Corre dentro de un callback: un error acá mostraría la pantalla roja antes de dibujar
+    # nada, así que se atrapa y se avisa en la misma pantalla (el borrador no se pierde).
+    try:
+        secuencia = _cd_borrador(collera["ColleraID"])
+        if all(secuencia) and _cd_guardadas_hoy().get(collera["ColleraID"]) != tuple(secuencia):
+            _cd_guardar_collera(collera, list(secuencia))
+    except Exception:
+        print(traceback.format_exc(), flush=True)
+        st.session_state.cd_mensaje = ("error", "No se pudo guardar esta collera ahora. Lo marcado sigue acá; "
+                                                "toca «Reintentar guardar».")
+
+def _cd_al_cambiar(collera: dict, pos: int):
+    _cd_borrador(collera["ColleraID"])[pos - 1] = st.session_state.get(_cd_clave(collera["ColleraID"], pos))
+    _cd_autoguardar(collera)
+
+def _cd_rellenar(collera: dict, modo: str):
+    borrador = _cd_borrador(collera["ColleraID"])
+    if modo == "buenos":
+        borrador[:] = [e or "Bueno" for e in borrador]
+    elif modo == "ultimo":
+        vigente = cargar_estado_collera(collera["ColleraID"])
+        borrador[:] = [vigente.get(p) for p in range(1, 24)]
+    elif modo == "limpiar":
+        borrador[:] = [None] * 23
+    if modo != "limpiar":
+        _cd_autoguardar(collera)
+
+def _cd_mover(ids: list, actual: str, paso: int):
+    i = ids.index(actual) + paso
+    if 0 <= i < len(ids):
+        st.session_state.cd_sel = ids[i]
+
+def page_control_durmientes_terreno():
+    app_header("Control de Durmientes", back_page="Inicio")
+    perfil_bar()
     st.caption(
-        "Registra el estado de cada durmiente (D1 a D23) de las colleras que inspeccionaste o "
-        "intervenidas hoy. Se precarga el último estado conocido; deja sin marcar lo que no "
-        "inspeccionaste (no se asume 'Bueno'). Norma NS-01-01-00: mínimo 10 efectivos y "
-        "máximo 3 'Malo' seguidos en recta / 2 en curva."
+        "Igual que la hoja A4 del PK: elige el PK y ve marcando cada collera (D1 a D23). Puedes "
+        "ir y volver entre colleras sin perder lo marcado. **Cada collera se guarda sola al "
+        "completar sus 23 durmientes.** Norma NS-01-01-00: mínimo 10 efectivos y racha "
+        "máxima de 'Malo' seguidos (2 en curva, 3 en recta)."
     )
-    if not st.session_state.reporte_colleras:
-        st.caption("Aún no hay colleras agregadas.")
-    for item in st.session_state.reporte_colleras:
-        rid = item["id"]
-        with st.container(border=True):
-            item["pk"] = st.number_input("PK", min_value=33, max_value=61, step=1, value=int(item["pk"]), key=f"col_pk_{rid}")
-            colleras_pk = cargar_colleras_de_pk(item["pk"])
-            if not colleras_pk:
-                st.warning(f"No hay colleras registradas para el PK {item['pk']}.")
-                item.pop("collera", None)
-                continue
-            por_id = {c["ColleraID"]: c for c in colleras_pk}
-            collera_id = st.selectbox(
-                "Collera", list(por_id), key=f"col_sel_{rid}",
-                format_func=lambda cid: (f"Collera {por_id[cid]['Collera']} · km {por_id[cid]['KmDesde']:.3f}–"
-                                         f"{por_id[cid]['KmHasta']:.3f} · {por_id[cid]['Ubicacion']}"),
-            )
-            collera = por_id[collera_id]
 
-            vigente = cargar_estado_collera(collera_id)
-            for pos in range(1, 24):
-                clave = _clave_durmiente(rid, collera_id, pos)
-                if clave not in st.session_state:
-                    st.session_state[clave] = vigente.get(pos)
+    # Streamlit borra el valor de los widgets al salir de la pantalla: se recuerda aparte
+    # (en *_mem) para que al volver siga en el mismo PK, collera y fecha.
+    for clave, por_defecto in (("cd_pk", 33), ("cd_fecha", datetime.now().date()), ("cd_sel", None)):
+        if clave not in st.session_state and st.session_state.get(f"{clave}_mem", por_defecto) is not None:
+            st.session_state[clave] = st.session_state.get(f"{clave}_mem", por_defecto)
+    c1, c2 = st.columns(2)
+    with c1:
+        pk = st.number_input("PK", min_value=33, max_value=61, step=1, key="cd_pk")
+    with c2:
+        st.date_input("Fecha de inspección", key="cd_fecha")
+    st.session_state.cd_pk_mem = int(pk)
+    st.session_state.cd_fecha_mem = st.session_state.cd_fecha
+    colleras_pk = cargar_colleras_de_pk(int(pk))
+    if not colleras_pk:
+        st.warning(f"No hay colleras registradas para el PK {pk}.")
+        return
+    por_id = {c["ColleraID"]: c for c in colleras_pk}
+    ids = list(por_id)
+    guardadas = _cd_guardadas_hoy()
 
-            b1, b2 = st.columns(2)
-            with b1:
-                st.button("✅ Marcar vacíos como Bueno", key=f"col_llenar_{rid}",
-                          on_click=_completar_vacios, args=(rid, collera_id, "Bueno"))
-            with b2:
-                st.button("↩️ Volver al último estado", key=f"col_restaurar_{rid}",
-                          on_click=_restaurar_vigente, args=(rid, collera_id))
+    def estado_txt(cid):
+        borrador = st.session_state.get("cd_borradores", {}).get(cid, [None] * 23)
+        if guardadas.get(cid) is not None and (not any(borrador) or tuple(borrador) == guardadas[cid]):
+            return "✅"
+        n = sum(1 for e in borrador if e)
+        return f"📝 {n}/23" if n else "⬜"
 
-            secuencia = []
-            for pos in range(1, 24):
-                secuencia.append(st.segmented_control(
-                    f"D{pos}", ESTADOS_DURMIENTE, format_func=ETIQUETA_ESTADO.get,
-                    key=_clave_durmiente(rid, collera_id, pos),
-                ))
-            item["collera"] = collera
-            item["secuencia"] = secuencia
+    n_guardadas = sum(1 for cid in ids if cid in guardadas)
+    st.progress(n_guardadas / len(ids), text=f"PK {pk}: {n_guardadas} de {len(ids)} colleras guardadas el {_cd_fecha_str()}")
 
-            ev = evaluar_secuencia(secuencia, collera["Ubicacion"])
-            st.markdown(f"**D1 → D23:** {franja_durmientes(secuencia)}")
-            st.caption("🟩 Bueno · 🟥 Malo · 🟦 Nuevo · 🟪 Reemplazado · ⬜ sin inspeccionar")
-            badge(ev["estado_general"], TIPO_BADGE_ESTADO.get(ev["estado_general"], "info"))
-            st.dataframe(tabla_indicadores_collera(ev), hide_index=True, width="stretch")
+    if st.session_state.get("cd_sel") not in por_id:
+        st.session_state.cd_sel = ids[0]
+    # El texto de cada opción debe ser FIJO: si cambia (p.ej. mostrando el avance ✅/📝),
+    # Streamlit lo toma como otro widget y vuelve a la primera collera. El avance va aparte.
+    collera_id = st.selectbox(
+        "Collera", ids, key="cd_sel",
+        format_func=lambda cid: (f"Collera {por_id[cid]['Collera']} · km {por_id[cid]['KmDesde']:.3f}–"
+                                 f"{por_id[cid]['KmHasta']:.3f} · {por_id[cid]['Ubicacion']}"),
+    )
+    collera = por_id[collera_id]
+    st.session_state.cd_sel_mem = collera_id
+    pendientes = [por_id[cid]["Collera"] for cid in ids if estado_txt(cid) != "✅"]
+    st.caption(f"Esta collera: **{estado_txt(collera_id)}** · Pendientes en el PK: "
+               + (", ".join(str(n) for n in pendientes[:15]) + (" …" if len(pendientes) > 15 else "") if pendientes else "ninguna 🎉"))
+    n1, n2 = st.columns(2)
+    with n1:
+        st.button("‹ Anterior", key="cd_anterior", on_click=_cd_mover, args=(ids, collera_id, -1),
+                  disabled=ids.index(collera_id) == 0, width="stretch")
+    with n2:
+        st.button("Siguiente ›", key="cd_siguiente", on_click=_cd_mover, args=(ids, collera_id, 1),
+                  disabled=ids.index(collera_id) == len(ids) - 1, width="stretch")
 
-            if st.button("🗑 Quitar collera", key=f"col_del_{rid}"):
-                st.session_state.reporte_colleras = [c for c in st.session_state.reporte_colleras if c["id"] != rid]
-                st.rerun()
+    mensaje = st.session_state.pop("cd_mensaje", None)
+    if mensaje:
+        (st.success if mensaje[0] == "ok" else st.error)(mensaje[1])
+
+    borrador = _cd_borrador(collera_id)
+    if not any(borrador) and guardadas.get(collera_id):
+        borrador[:] = list(guardadas[collera_id])  # reabrir lo ya guardado hoy para corregirlo
+    vigente = cargar_estado_collera(collera_id)
+    st.caption(f"Último estado registrado: {franja_durmientes([vigente.get(p) for p in range(1, 24)])}")
+
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        st.button("✅ Vacíos = Bueno", key="cd_buenos", on_click=_cd_rellenar, args=(collera, "buenos"), width="stretch")
+    with b2:
+        st.button("↩️ Copiar último", key="cd_ultimo", on_click=_cd_rellenar, args=(collera, "ultimo"), width="stretch")
+    with b3:
+        st.button("🧹 Limpiar", key="cd_limpiar", on_click=_cd_rellenar, args=(collera, "limpiar"), width="stretch")
+
+    for pos in range(1, 24):
+        clave = _cd_clave(collera_id, pos)
+        st.session_state[clave] = borrador[pos - 1]
+        st.segmented_control(
+            f"D{pos}", ESTADOS_DURMIENTE, format_func=ETIQUETA_ESTADO.get, key=clave,
+            on_change=_cd_al_cambiar, args=(collera, pos),
+        )
+
+    secuencia = list(borrador)
+    ev = evaluar_secuencia(secuencia, collera["Ubicacion"])
+    marcados = sum(1 for e in secuencia if e)
+    st.markdown(f"**D1 → D23:** {franja_durmientes(secuencia)}")
+    st.caption("🟩 Bueno · 🟥 Malo · 🟦 Nuevo · 🟪 Reemplazado · ⬜ sin marcar")
+    if marcados < 23:
+        st.info(f"{marcados}/23 durmientes marcados. Completa los 23 y la collera se guarda sola.")
+    elif guardadas.get(collera_id) == tuple(secuencia):
+        st.success(f"Collera {collera['Collera']} guardada ✅")
+    else:
+        st.warning("La collera está completa pero aún no se guarda.")
+        st.button("💾 Reintentar guardar", key="cd_reintentar", on_click=_cd_autoguardar, args=(collera,))
+    badge(ev["estado_general"], TIPO_BADGE_ESTADO.get(ev["estado_general"], "info"))
+    st.dataframe(tabla_indicadores_collera(ev), hide_index=True, width="stretch")
+
+    with st.expander(f"📋 Resumen del PK {pk} (como la hoja A4)"):
+        filas = []
+        for cid in ids:
+            c = por_id[cid]
+            seq = st.session_state.get("cd_borradores", {}).get(cid)
+            if not seq or not any(seq):
+                seq = list(guardadas.get(cid) or [None] * 23)
+            ev_c = evaluar_secuencia(seq, c["Ubicacion"])
+            filas.append({"Collera": c["Collera"], "Avance": estado_txt(cid), "D1 → D23": franja_durmientes(seq),
+                          "Estado": ev_c["estado_general"] if any(seq) else "—"})
+        st.dataframe(pd.DataFrame(filas), hide_index=True, width="stretch")
 
 def render_equipos_section():
     st.caption("Marca los equipos utilizados durante la jornada e indica la cantidad.")
@@ -2568,15 +2902,6 @@ def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_su
     if not trabajos:
         return {"ok": False, "msg": "Agrega al menos una actividad en la sección Trabajos antes de guardar."}
 
-    colleras_insp = [c for c in st.session_state.reporte_colleras if c.get("collera")]
-    ids_colleras = [c["collera"]["ColleraID"] for c in colleras_insp]
-    repetidas = sorted({cid for cid in ids_colleras if ids_colleras.count(cid) > 1})
-    if repetidas:
-        return {"ok": False, "msg": f"La collera {', '.join(repetidas)} está agregada más de una vez. Deja solo una."}
-    vacias = [c["collera"]["ColleraID"] for c in colleras_insp if not any(c["secuencia"])]
-    if vacias:
-        return {"ok": False, "msg": f"La collera {', '.join(vacias)} no tiene ningún durmiente marcado. Márcalos o quítala."}
-
     try:
         reporte_id = next_reporte_id()
     except Exception:
@@ -2592,9 +2917,8 @@ def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_su
          t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hombres"], t["hh"]]
         for t in trabajos_calc
     ]
-    inspeccion_rows = [fila_inspeccion(reporte_id, fecha_str, c["collera"], c["secuencia"]) for c in colleras_insp]
-    cambios_durmientes = filas_cambios_durmientes(
-        reporte_id, fecha_str, {c["collera"]["ColleraID"]: c["secuencia"] for c in colleras_insp})
+    # Colleras ya guardadas por este jefe de grupo en Control de Durmientes ese día: van en el PDF/Excel.
+    colleras_del_dia = colleras_desde_inspecciones(inspecciones_filtradas(fecha_str, st.session_state.usuario))
     equipos_usados = equipos_seleccionados()
     equipos_rows = [[reporte_id, e["nombre"], e["cantidad"]] for e in equipos_usados]
     materiales_rows = [
@@ -2633,12 +2957,10 @@ def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_su
     guardado = guardar_bloques({
         "Reportes": [reporte_row], "Trabajos": trabajos_rows, "Equipos": equipos_rows,
         "Materiales": materiales_rows, "Asistencia": asistencia_rows, "Fotos": fotos_rows,
-        "InspeccionColleras": inspeccion_rows, "DurmientesEstado": cambios_durmientes,
     })
     if not guardado:
         return {"ok": False, "msg": "No se pudo guardar el reporte en Google Sheets (sin conexión o Google no respondió). "
                                     "No se guardó nada a medias: lo que ingresaste sigue en el formulario, intenta de nuevo."}
-    persistir_cambios_durmientes_local(cambios_durmientes)
     fotos_respaldo = _respaldar_fotos_sheets(reporte_id, fotos_guardadas)
 
     resumen = {
@@ -2651,7 +2973,7 @@ def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_su
         "asistencia": list(st.session_state.reporte_asistencia),
         "fotos": fotos_guardadas,
         "fotos_respaldo": fotos_respaldo,
-        "colleras": [resumen_collera(c["collera"], c["secuencia"]) for c in colleras_insp],
+        "colleras": colleras_del_dia,
         "total_hh": sum(t["hh"] for t in trabajos_calc),
     }
 
@@ -2665,9 +2987,18 @@ def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_su
         f"{len(resumen['asistencia'])} trabajador(es) en asistencia, {resumen['total_hh']:.0f} HH totales."
         + texto_colleras
     )
-    resumen["aviso_id"] = crear_aviso_desde_reporte(reporte_id, grupo_via, ubicacion, resumen_texto)
-
-    excel_bytes, pdf_bytes = generar_documentos_reporte(resumen)
+    # El reporte YA quedó guardado en Sheets: si algo de aquí en adelante falla, no se debe
+    # mostrar como error (el jefe de grupo lo guardaría de nuevo y quedaría duplicado).
+    try:
+        resumen["aviso_id"] = crear_aviso_desde_reporte(reporte_id, grupo_via, ubicacion, resumen_texto)
+    except Exception:
+        print(traceback.format_exc(), flush=True)
+        resumen["aviso_id"] = "(pendiente: se puede recuperar desde Avanzado)"
+    try:
+        excel_bytes, pdf_bytes = generar_documentos_reporte(resumen)
+    except Exception:
+        print(traceback.format_exc(), flush=True)
+        excel_bytes, pdf_bytes = None, None  # se pueden regenerar desde Mis Reportes
 
     return {"ok": True, "msg": f"Reporte {reporte_id} guardado ✅", "resumen": resumen,
             "excel_bytes": excel_bytes, "pdf_bytes": pdf_bytes}
@@ -2678,10 +3009,14 @@ def page_generar_reporte():
 
     st.markdown("#### Datos generales")
     c1, c2 = st.columns(2)
+    recordar_widget("rep_grupo_via")
+    recordar_widget("rep_fecha", datetime.now().date())
     with c1:
         grupo_via = st.selectbox("Grupo Vía", GRUPOS_VIA, key="rep_grupo_via")
     with c2:
-        fecha_reporte = st.date_input("Fecha", datetime.now().date(), key="rep_fecha")
+        fecha_reporte = st.date_input("Fecha", key="rep_fecha")
+    memorizar_widget("rep_grupo_via_mem", grupo_via)
+    memorizar_widget("rep_fecha_mem", fecha_reporte)
     horas_dia = horas_jornada_por_fecha(fecha_reporte)
     st.caption(f"📅 {DIAS_ES[fecha_reporte.weekday()]} → jornada estándar: **{horas_dia} h por trabajador** "
                f"(se usará para calcular las Horas Hombre de cada actividad).")
@@ -2698,9 +3033,14 @@ def page_generar_reporte():
 
     st.divider()
     st.markdown("#### 🛤️ Control de Durmientes por Collera")
-    render_colleras_section()
-    if st.button("➕ Agregar collera", key="btn_add_collera"):
-        st.session_state.reporte_colleras.append(new_collera_row())
+    n_colleras = len(inspecciones_filtradas(fecha_reporte.strftime("%Y-%m-%d"), st.session_state.usuario))
+    st.caption(
+        f"Se registra en la pantalla **Control de Durmientes** (botón en Inicio). Llevas **{n_colleras}** "
+        f"collera(s) guardada(s) el {fecha_reporte:%d/%m/%Y}; se incluirán en el PDF y Excel de este reporte."
+    )
+    if st.button("🛤️ Ir a Control de Durmientes", key="btn_ir_control_durmientes"):
+        st.session_state.cd_fecha_mem = fecha_reporte
+        st.session_state.page = "Control Durmientes"
         st.rerun()
 
     st.divider()
@@ -2723,8 +3063,10 @@ def page_generar_reporte():
 
     st.divider()
     st.markdown("#### 📝 Observaciones")
+    recordar_widget("rep_observaciones")
     observaciones = st.text_area("Observaciones", key="rep_observaciones", height=100, label_visibility="collapsed",
                                   placeholder="Comentarios, novedades o información relevante de la jornada...")
+    memorizar_widget("rep_observaciones_mem", observaciones)
 
     st.divider()
     st.markdown("#### 👷 Control de Asistencia")
@@ -2842,28 +3184,32 @@ def page_reporte_guardado():
 
     st.divider()
     st.markdown("#### Descargar reporte")
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        st.download_button(
-            "⬇️ Descargar Excel", data=st.session_state.last_reporte_excel,
-            file_name=f"Reporte_{resumen['reporte_id']}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="btn_descargar_excel", width="stretch",
-        )
-    with dl2:
-        st.download_button(
-            "⬇️ Descargar PDF", data=st.session_state.last_reporte_pdf,
-            file_name=f"Reporte_{resumen['reporte_id']}.pdf", mime="application/pdf",
-            key="btn_descargar_pdf", width="stretch",
-        )
+    if not (st.session_state.last_reporte_excel and st.session_state.last_reporte_pdf):
+        st.info("El reporte quedó guardado, pero no se pudieron generar los archivos ahora. "
+                "Descárgalos desde **Mis Reportes** → Ver → «Preparar Excel y PDF».")
+    else:
+        dl1, dl2 = st.columns(2)
+        with dl1:
+            st.download_button(
+                "⬇️ Descargar Excel", data=st.session_state.last_reporte_excel,
+                file_name=f"Reporte_{resumen['reporte_id']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="btn_descargar_excel", width="stretch",
+            )
+        with dl2:
+            st.download_button(
+                "⬇️ Descargar PDF", data=st.session_state.last_reporte_pdf,
+                file_name=f"Reporte_{resumen['reporte_id']}.pdf", mime="application/pdf",
+                key="btn_descargar_pdf", width="stretch",
+            )
 
-    st.divider()
-    st.markdown("#### Enviar por correo")
-    render_boton_compartir_excel(st.session_state.last_reporte_excel, resumen["reporte_id"], resumen)
-    st.caption(
-        "Abre el panel de Compartir del celular (Correo, Gmail, WhatsApp, etc.) con el Excel ya adjunto. "
-        "Si el navegador no lo permite, se abrirá el correo sin adjunto — usa el botón Descargar Excel de arriba y adjúntalo a mano."
-    )
+        st.divider()
+        st.markdown("#### Enviar por correo")
+        render_boton_compartir_excel(st.session_state.last_reporte_excel, resumen["reporte_id"], resumen)
+        st.caption(
+            "Abre el panel de Compartir del celular (Correo, Gmail, WhatsApp, etc.) con el Excel ya adjunto. "
+            "Si el navegador no lo permite, se abrirá el correo sin adjunto — usa el botón Descargar Excel de arriba y adjúntalo a mano."
+        )
 
     st.divider()
     st.info(
@@ -2900,9 +3246,15 @@ def terreno_inicio():
         if st.button("📝  Generar Reporte", key="btn_generar_reporte"):
             st.session_state.page = "Generar Reporte"
             st.rerun()
-    if st.button(f"📋  Mis Avisos · {pend} Pendientes", key="btn_mis_avisos"):
-        st.session_state.page = "Mis Avisos"
-        st.rerun()
+    c3, c4 = st.columns(2)
+    with c3:
+        if st.button(f"📋  Mis Avisos · {pend} Pendientes", key="btn_mis_avisos"):
+            st.session_state.page = "Mis Avisos"
+            st.rerun()
+    with c4:
+        if st.button("🛤️  Control de Durmientes", key="btn_control_durmientes_terreno"):
+            st.session_state.page = "Control Durmientes"
+            st.rerun()
     if st.button("🗂️  Mis Reportes (histórico)", key="btn_mis_reportes"):
         st.session_state.page = "Mis Reportes"
         st.rerun()
@@ -2975,6 +3327,8 @@ def flujo_terreno():
         terreno_mis_avisos()
     elif page == "Mis Reportes":
         terreno_mis_reportes()
+    elif page == "Control Durmientes":
+        page_control_durmientes_terreno()
     elif page == "Detalle Reporte":
         terreno_detalle_reporte()
     else:
@@ -3129,7 +3483,11 @@ def validador_detalle():
         return
 
     df = st.session_state.avisos
-    row = df[df["AvisoID"] == aviso_id].iloc[0].to_dict()
+    filas_aviso = df[df["AvisoID"] == aviso_id]
+    if filas_aviso.empty:  # p.ej. se llegó con el botón Atrás a un aviso que ya no está en la lista
+        st.info(f"No se encontró el aviso {aviso_id}. Vuelve al Backlog y elígelo de nuevo.")
+        return
+    row = filas_aviso.iloc[0].to_dict()
 
     tiene_reporte = bool(row.get("ReporteID"))
     if tiene_reporte:
@@ -3635,9 +3993,9 @@ def sincronizar_historial_navegador():
     if isinstance(valor, dict) and valor.get("pagina") and valor.get("t") != st.session_state.get("nav_historial_t"):
         st.session_state.nav_historial_t = valor.get("t")
         st.session_state.page = valor["pagina"]
-    # Contenedor fijo al inicio: el componente conserva siempre la misma posición y no se
-    # vuelve a crear en cada cambio de pantalla (si se recreara, perdería el historial).
-    with st.container(key="nav_historial_box"):
+    # Contenedor fijo al inicio (_caja_componentes): el componente conserva siempre la misma
+    # posición y no se vuelve a crear en cada cambio de pantalla (si se recreara, perdería el historial).
+    with _caja_componentes:
         try:
             _nav_historial(pagina=st.session_state.page, key="nav_historial", default=None)
         except Exception:
@@ -3646,9 +4004,45 @@ def sincronizar_historial_navegador():
 sincronizar_historial_navegador()
 
 # -------------------------
+# Errores inesperados: en vez de la pantalla roja de Streamlit, un aviso claro y la
+# opción de reintentar o volver al Inicio. Lo ya guardado en Google Sheets no se pierde, y
+# los borradores quedan en el celular. (st.rerun/st.stop no son Exception: no se atrapan.)
+# -------------------------
+def mostrar_error_amigable(error: Exception):
+    detalle = traceback.format_exc()
+    print(f"[ERROR {now_str()}] página={st.session_state.get('page')} usuario={st.session_state.get('usuario')}\n{detalle}", flush=True)
+    st.error(
+        "⚠️ Ocurrió un problema al mostrar esta pantalla. **Lo que ya estaba guardado no se perdió** "
+        "y lo que tenías sin guardar sigue respaldado en este celular. Prueba reintentar o volver al Inicio; "
+        "si se repite, avisa al administrador con el detalle de abajo."
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🔄 Reintentar", key="btn_error_reintentar", width="stretch"):
+            st.rerun()
+    with c2:
+        if st.button("🏠 Ir al Inicio", key="btn_error_inicio", width="stretch"):
+            st.session_state.page = "Inicio"
+            st.rerun()
+    with st.expander("Detalle técnico (para el administrador)"):
+        st.code(f"{type(error).__name__}: {error}\n\n{detalle}", language=None)
+
+aviso_borradores = st.session_state.pop("aviso_borradores", None)
+if aviso_borradores:
+    st.toast(f"💾 {aviso_borradores}")
+
+# -------------------------
 # Enrutamiento por perfil
 # -------------------------
-if st.session_state.perfil == "Personal Terreno":
-    flujo_terreno()
-else:
-    flujo_validador()
+try:
+    if st.session_state.perfil == "Personal Terreno":
+        flujo_terreno()
+    else:
+        flujo_validador()
+except Exception as error:
+    mostrar_error_amigable(error)
+
+# Al FINAL de cada interacción (no al inicio): así la copia en el celular incluye lo que
+# se acaba de escribir en esta misma interacción.
+with _caja_componentes:
+    sincronizar_almacen_local()
