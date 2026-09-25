@@ -28,7 +28,7 @@ from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.units import cm
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage, Flowable, PageBreak
 
 st.set_page_config(page_title="efe · Trenes & CHILE", page_icon="🚆", layout="centered", initial_sidebar_state="collapsed")
 
@@ -68,6 +68,10 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
     div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 100% !important; flex: 1 1 100% !important; }
     .st-key-bottom_nav div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 0 !important; flex: 1 1 0 !important; }
     .st-key-header_row div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 0 !important; }
+    .st-key-cd_nav div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
+    .st-key-cd_nav div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 0 !important; }
+    .st-key-cd_nav div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:first-child { flex: 1 1 0 !important; }
+    .st-key-cd_nav div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:last-child { flex: 3 1 0 !important; }
 }
 
 /* ---- Home action cards (colored) ---- */
@@ -85,6 +89,9 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
 .st-key-btn_mis_avisos button { background: #0B3B8A !important; color: #fff !important; border: none !important; text-align: left !important; }
 .st-key-btn_control_durmientes_terreno button { background: #2FA84F !important; color: #fff !important; border: none !important; text-align: left !important; }
 .st-key-cd_siguiente button { background: #0B3B8A !important; color: #fff !important; border: none !important; }
+/* Durmientes malos marcados: rojo, como la X de la ficha en papel */
+.st-key-cd_pills_box button[kind$="Active"] { background: #DC3545 !important; color: #fff !important; border-color: #DC3545 !important; }
+.st-key-cd_pills_box button { min-width: 2.6rem; justify-content: center; font-weight: 700; }
 .st-key-btn_mis_reportes button { background: #3D7DD9 !important; color: #fff !important; border: none !important; text-align: left !important; }
 .st-key-btn_rechazar button { background: #DC3545 !important; color: #fff !important; border: none !important; }
 .st-key-btn_observar button { background: #E0A458 !important; color: #fff !important; border: none !important; }
@@ -774,6 +781,12 @@ def _asegurar_hoja(spreadsheet, nombre_hoja: str, headers: list | None = None):
 def _hoja_sheets(spreadsheet, nombre_hoja: str, headers: list | None = None):
     return _asegurar_hoja(spreadsheet, nombre_hoja, headers)[0]
 
+@st.cache_resource(ttl=600, show_spinner=False)
+def _preparar_hojas_cache(nombres: tuple) -> dict:
+    """Estructura de las hojas (worksheet + encabezados) en caché 10 min: al guardar
+    colleras una tras otra, cada guardado queda en 1 sola llamada a Google (la escritura)."""
+    return _preparar_hojas(_cliente_sheets(), list(nombres))
+
 def _preparar_hojas(spreadsheet, nombres: list) -> dict:
     """{nombre: (worksheet, encabezados reales)} para varias hojas con 2 llamadas a la API
     en total (en vez de 2 por hoja). Solo si falta una hoja o columnas usa _asegurar_hoja."""
@@ -850,7 +863,9 @@ def guardar_bloques(bloques: dict) -> bool:
                 break
             try:
                 requests = []
-                hojas = _preparar_hojas(sh, list(bloques))
+                if intento:  # si el primer intento falló, la estructura en caché pudo quedar vieja
+                    _preparar_hojas_cache.clear()
+                hojas = _preparar_hojas_cache(tuple(bloques))
                 for nombre_hoja, filas in bloques.items():
                     ws, header_real = hojas[nombre_hoja]
                     requests.append({"appendCells": {
@@ -1413,15 +1428,15 @@ def _secuencia_en_letras(secuencia: list) -> str:
     letras = "".join(_LETRA_ESTADO.get(e, "-") for e in secuencia)
     return " ".join(letras[i:i + 5] for i in range(0, len(letras), 5))
 
-def hoja_excel_durmientes(wb, colleras: list, con_reporte: bool = False):
-    """Agrega una hoja 'Durmientes' con el mismo formato que 'Control Durmientes' del Excel
-    (una fila por collera: D1..D23 + columnas calculadas). `colleras` = lista de
-    resumen_collera(); con_reporte=True agrega ReporteID y Fecha al inicio (histórico)."""
-    ws = wb.create_sheet("Durmientes")
+def hoja_excel_durmientes(wb, colleras: list, con_reporte: bool = False, titulo: str = "Durmientes"):
+    """Agrega una hoja con el formato de 'Control Durmientes' del Excel (una fila por
+    collera: D1..D23 + indicadores). Solo los indicadores que aplican con Bueno/Malo (lo
+    que se marca en terreno). `colleras` = lista de resumen_collera(); con_reporte=True
+    agrega ReporteID y Fecha al inicio (histórico)."""
+    ws = wb.create_sheet(titulo)
     base = ["REPORTE", "FECHA"] if con_reporte else []
     headers = base + ["PK", "COLLERA", "UBICACIÓN"] + [f"D{p}" for p in range(1, 24)] + [
-        "TOTAL REGISTRADO", "N° BUENOS", "N° MALOS", "N° NUEVOS", "N° REEMPL.", "EFECTIVOS (B+N+R)",
-        "% RENOV. (N+R)", "MÍN. EFECTIVOS", "RACHA CONSEC.", "ESTADO GENERAL"]
+        "N° BUENOS", "N° MALOS", "EFECTIVOS", "MÍN. EFECTIVOS", "RACHA CONSEC.", "ESTADO GENERAL"]
     ws.append(headers)
     for celda in ws[1]:
         celda.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
@@ -1431,19 +1446,148 @@ def hoja_excel_durmientes(wb, colleras: list, con_reporte: bool = False):
     for c in colleras:
         ws.append(([c.get("reporte_id", ""), c.get("fecha", "")] if con_reporte else [])
                   + [c["pk"], c["collera"], c["ubicacion"]] + [e or "" for e in c["secuencia"]]
-                  + [c["total_registrado"], c["n_buenos"], c["n_malos"], c["n_nuevos"], c["n_reempl"],
-                     c["efectivos"], c["pct_renovacion"], c["min_efectivos"], c["racha_consec"], c["estado_general"]])
+                  + [c["efectivos"], c["n_malos"], c["efectivos"], c["min_efectivos"], c["racha_consec"], c["estado_general"]])
         fila = ws.max_row
         for i, e in enumerate(c["secuencia"]):
             if e in _RELLENO_ESTADO_DURM:
                 ws.cell(row=fila, column=col_d1 + i).fill = openpyxl.styles.PatternFill("solid", fgColor=_RELLENO_ESTADO_DURM[e])
-        ws.cell(row=fila, column=col_d1 + 29).number_format = "0.0%"
-        celda_estado = ws.cell(row=fila, column=col_d1 + 32)
+        celda_estado = ws.cell(row=fila, column=col_d1 + 28)
         if c["estado_general"] in _RELLENO_ESTADO_GENERAL:
             celda_estado.fill = openpyxl.styles.PatternFill("solid", fgColor=_RELLENO_ESTADO_GENERAL[c["estado_general"]])
-    anchos = ([11, 11] if con_reporte else []) + [6, 9, 22] + [11] * 23 + [11, 9, 9, 9, 9, 11, 10, 11, 10, 20]
+    anchos = ([11, 11] if con_reporte else []) + [6, 9, 22] + [11] * 23 + [10, 9, 10, 11, 10, 20]
     _ajustar_anchos_columnas(ws, anchos)
     ws.freeze_panes = ws.cell(row=2, column=col_d1)
+
+class _CeldaDurmiente(Flowable):
+    """Casilla de la ficha: el número del durmiente y, si está malo, una X encima (igual que
+    se tacha a mano en la ficha de papel). Sin inspeccionar: número en gris claro."""
+    def __init__(self, numero: int, malo: bool, inspeccionada: bool, ancho: float, alto: float):
+        super().__init__()
+        self.numero, self.malo, self.inspeccionada = numero, malo, inspeccionada
+        self.ancho, self.alto = ancho, alto
+
+    def wrap(self, *_):
+        return self.ancho, self.alto
+
+    def draw(self):
+        c = self.canv
+        c.setFont("Helvetica-Bold", 7)
+        c.setFillColor(colors.HexColor("#222222" if self.inspeccionada else "#B5B9BF"))
+        c.drawCentredString(self.ancho / 2, self.alto / 2 - 2.5, str(self.numero))
+        if self.malo:
+            m = 1.6
+            c.setStrokeColor(colors.HexColor("#1A1A1A"))  # como la X a lápiz de la ficha
+            c.setLineWidth(1.2)
+            c.line(m, m, self.ancho - m, self.alto - m)
+            c.line(m, self.alto - m, self.ancho - m, m)
+
+def generar_pdf_ficha_durmientes(pk: int, fecha_str: str, colleras_pk: list, inspeccionadas: dict, usuario: str) -> bytes:
+    """PDF con el mismo formato que la 'Ficha de Durmientes' en papel: encabezado (SD, PK,
+    fecha), una fila por collera con los 23 durmientes numerados y una X sobre los malos, y
+    Observaciones (se anota ahí si la collera no cumple la norma o no se registró).
+    `inspeccionadas` = {ColleraID: secuencia de 23}. 45 colleras por página, como la ficha."""
+    buf = io.BytesIO()
+    margen = 1.1 * cm
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=margen, bottomMargin=1.3 * cm, leftMargin=margen, rightMargin=margen)
+    ancho_util = A4[0] - 2 * margen
+    ancho_collera, ancho_d = 1.0 * cm, 0.6 * cm
+    ancho_obs = ancho_util - ancho_collera - 23 * ancho_d
+    alto_fila = 0.5 * cm
+    try:
+        fecha_txt = datetime.strptime(fecha_str, "%Y-%m-%d").strftime("%d-%m-%Y")
+    except ValueError:
+        fecha_txt = fecha_str
+
+    est = {
+        "etq": ParagraphStyle("f_etq", fontName="Helvetica-Bold", fontSize=8),
+        "val": ParagraphStyle("f_val", fontName="Helvetica-Bold", fontSize=11),
+        "tit": ParagraphStyle("f_tit", fontName="Helvetica-Bold", fontSize=12, alignment=1),
+        "marca": ParagraphStyle("f_marca", fontName="Helvetica-Bold", fontSize=11, alignment=2, textColor=colors.HexColor("#0B3B8A")),
+        "obs": ParagraphStyle("f_obs", fontName="Helvetica", fontSize=6, leading=7),
+    }
+
+    def encabezado():
+        t = Table([
+            [Paragraph("SD", est["etq"]), "", Paragraph("FICHA DE DURMIENTES", est["tit"]), Paragraph("icil-icafal", est["marca"])],
+            [Paragraph("PK", est["etq"]), Paragraph(str(pk), est["val"]),
+             Paragraph(f"FECHA&nbsp;&nbsp;<b>{fecha_txt}</b>", ParagraphStyle("f_fecha", fontName="Helvetica", fontSize=9, alignment=1)), ""],
+        ], colWidths=[1.0 * cm, 2.2 * cm, ancho_util - 7.2 * cm, 4.0 * cm], rowHeights=[0.6 * cm, 0.6 * cm])
+        t.setStyle(TableStyle([
+            ("BOX", (0, 0), (1, 1), 0.8, colors.black), ("INNERGRID", (0, 0), (1, 1), 0.5, colors.black),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        return t
+
+    def fila_encabezado_tabla():
+        return [Paragraph("<b>Collera</b>", ParagraphStyle("f_h", fontName="Helvetica-Bold", fontSize=5.5, alignment=1)),
+                Paragraph("<b>Durmientes</b>", ParagraphStyle("f_hd", fontName="Helvetica-Bold", fontSize=7, alignment=1))] \
+            + [""] * 22 + [Paragraph("<b>Observaciones</b>", ParagraphStyle("f_ho", fontName="Helvetica-Bold", fontSize=7, alignment=1))]
+
+    filas = []
+    for c in colleras_pk:
+        secuencia = inspeccionadas.get(c["ColleraID"])
+        inspeccionada = secuencia is not None
+        malos = set(_cd_malos(secuencia)) if inspeccionada else set()
+        if not inspeccionada:
+            obs = "Sin registrar"
+        else:
+            ev = evaluar_secuencia(list(secuencia), c["Ubicacion"])
+            obs = "" if ev["estado_general"] == "Cumple" else ev["estado_general"]
+        filas.append([str(c["Collera"])]
+                     + [_CeldaDurmiente(p, p in malos, inspeccionada, ancho_d, alto_fila) for p in range(1, 24)]
+                     + [Paragraph(obs, est["obs"])])
+
+    el = []
+    por_pagina = 45
+    for i in range(0, len(filas), por_pagina):
+        if i:
+            el.append(PageBreak())
+        el.append(encabezado())
+        el.append(Spacer(1, 6))
+        bloque = filas[i:i + por_pagina]
+        t = Table([fila_encabezado_tabla()] + bloque, colWidths=[ancho_collera] + [ancho_d] * 23 + [ancho_obs],
+                  rowHeights=[0.45 * cm] + [alto_fila] * len(bloque))
+        t.setStyle(TableStyle([
+            ("SPAN", (1, 0), (23, 0)),
+            ("LEFTPADDING", (0, 0), (0, 0), 1), ("RIGHTPADDING", (0, 0), (0, 0), 1),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+            ("BOX", (0, 0), (-1, -1), 1.0, colors.black),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#D9D9D9")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#EDEDED")]),
+            ("ALIGN", (0, 1), (0, -1), "CENTER"), ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"), ("FONTSIZE", (0, 1), (0, -1), 7.5),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (1, 1), (23, -1), 0), ("RIGHTPADDING", (1, 1), (23, -1), 0),
+            ("TOPPADDING", (1, 1), (23, -1), 0), ("BOTTOMPADDING", (1, 1), (23, -1), 0),
+        ]))
+        el.append(t)
+
+    n_insp = len([c for c in colleras_pk if c["ColleraID"] in inspeccionadas])
+    n_no = sum(1 for c in colleras_pk if c["ColleraID"] in inspeccionadas and
+               evaluar_secuencia(list(inspeccionadas[c["ColleraID"]]), c["Ubicacion"])["estado_general"] in ESTADOS_NO_CUMPLE)
+    el.append(Spacer(1, 6))
+    el.append(Paragraph(f"X = durmiente malo · {n_insp} de {len(colleras_pk)} colleras registradas · "
+                        f"{n_no} no cumple(n) la Norma NS-01-01-00", est["obs"]))
+
+    def pie(canvas, d):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 6.5)
+        canvas.setFillColor(colors.HexColor("#8A8F98"))
+        canvas.drawString(margen, 0.7 * cm, f"PK {pk} · {fecha_txt} · Registrado por {usuario} · Generado {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+        canvas.drawRightString(A4[0] - margen, 0.7 * cm, f"Página {d.page}")
+        canvas.restoreState()
+
+    doc.build(el, onFirstPage=pie, onLaterPages=pie)
+    return buf.getvalue()
+
+def generar_excel_ficha_durmientes(pk: int, fecha_str: str, colleras_pk: list, inspeccionadas: dict) -> bytes:
+    """Excel de la ficha: una fila por collera registrada con D1..D23 e indicadores."""
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    colleras = [resumen_collera(c, list(inspeccionadas[c["ColleraID"]])) for c in colleras_pk if c["ColleraID"] in inspeccionadas]
+    hoja_excel_durmientes(wb, colleras, titulo=f"PK {pk} {fecha_str}")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 def colleras_desde_inspecciones(df_insp: pd.DataFrame) -> list:
     """Convierte filas de la hoja InspeccionColleras en la lista de resumen_collera()."""
@@ -1510,16 +1654,15 @@ def generar_pdf_reporte(resumen: dict) -> bytes:
     if resumen.get("colleras"):
         el.append(_seccion_pdf("Control de Durmientes por Collera (Norma NS-01-01-00)"))
         el.append(Spacer(1, 4))
-        headers_col = ["Collera", "Ubicación", "D1 → D23", "B", "M", "N", "R", "Efect.", "% Renov.", "Mín. Efect.", "Racha", "Estado"]
-        anchos_col = [40, 52, 112, 20, 20, 20, 20, 32, 38, 44, 36, 76]
+        # En terreno solo se marca Bueno/Malo: se muestran solo los indicadores que aplican.
+        headers_col = ["Collera", "Ubicación", "Durmientes malos", "N° Buenos", "N° Malos", "Efectivos", "Mín. Efect.", "Racha", "Estado"]
+        anchos_col = [40, 50, 100, 40, 40, 58, 50, 40, 92]
         filas_col = [
-            [c["collera_id"], c["ubicacion"], _secuencia_en_letras(c["secuencia"]),
-             c["n_buenos"], c["n_malos"], c["n_nuevos"], c["n_reempl"], c["efectivos"],
-             f"{c['pct_renovacion'] * 100:.1f}%", c["min_efectivos"], c["racha_consec"], c["estado_general"]]
+            [c["collera_id"], c["ubicacion"], ", ".join(str(p) for p in _cd_malos(c["secuencia"])) or "—",
+             c["efectivos"], c["n_malos"], c["efectivos"], c["min_efectivos"], c["racha_consec"], c["estado_general"]]
             for c in resumen["colleras"]
         ]
         el.append(_tabla_pdf(headers_col, filas_col, anchos_col))
-        el.append(Paragraph("B = Bueno · M = Malo · N = Nuevo · R = Reemplazado · - = sin inspeccionar", _ESTILO_CELDA_PDF))
         el.append(Spacer(1, 12))
 
     el.append(_seccion_pdf("Equipos"))
@@ -2540,15 +2683,13 @@ TIPO_BADGE_ESTADO = {"Cumple": "ok", "No Cumple": "bad", "No Cumple (racha)": "b
                      "Inspección Incompleta": "warn", "Sin Inspeccionar": "muted"}
 
 def tabla_indicadores_collera(ev: dict) -> pd.DataFrame:
-    """Los mismos indicadores de la hoja 'Control Durmientes' del Excel (columnas AA:AK)."""
+    """Indicadores de la hoja 'Control Durmientes' del Excel que aplican cuando en terreno
+    solo se marca Bueno/Malo (sin Nuevos, Reemplazados ni % de renovación). N° Buenos =
+    todo lo que no está malo (igual que la ficha: lo no tachado es bueno)."""
     return pd.DataFrame([
-        ("TOTAL REGISTRADO", ev["total_registrado"]),
-        ("N° BUENOS", ev["n_buenos"]),
+        ("N° BUENOS", ev["efectivos"]),
         ("N° MALOS", ev["n_malos"]),
-        ("N° NUEVOS", ev["n_nuevos"]),
-        ("N° REEMPL.", ev["n_reempl"]),
-        ("EFECTIVOS (B+N+R)", ev["efectivos"]),
-        ("% RENOV. (N+R)", f"{ev['pct_renovacion'] * 100:.1f}%"),
+        ("EFECTIVOS", ev["efectivos"]),
         ("MÍN. EFECTIVOS (≥10)", ev["min_efectivos"]),
         (f"RACHA CONSEC. (máx. {ev['limite_racha']} Malo)", f"{ev['racha_consec']} (racha {ev['racha_max']})"),
         ("ESTADO GENERAL", ev["estado_general"]),
@@ -2574,15 +2715,16 @@ def inspecciones_filtradas(fecha_str: str | None = None, usuario: str | None = N
         mascara |= (df["Fecha"].astype(str).str[:10] == str(fecha_str)[:10]) & (df["Usuario"].astype(str) == str(usuario))
     return df[mascara].drop_duplicates("ColleraID", keep="last")
 
-def _cd_clave(collera_id: str, pos: int) -> str:
-    return f"cd_{collera_id}_{pos}"
+# Igual que la "Ficha de Durmientes" en papel: cada collera parte con sus 23 durmientes en
+# Bueno y el jefe de grupo solo toca los que están MALOS (los que tacha con X en la ficha).
+# El borrador de cada collera (cd_borradores) es una lista de 23 con "Malo" o None.
 
 def _cd_fecha_str() -> str:
     fecha = st.session_state.get("cd_fecha") or st.session_state.get("cd_fecha_mem") or datetime.now().date()
     return fecha.strftime("%Y-%m-%d")
 
-def _cd_borrador(collera_id: str) -> list:
-    return st.session_state.setdefault("cd_borradores", {}).setdefault(collera_id, [None] * 23)
+def _cd_malos(secuencia) -> list:
+    return [p for p, e in enumerate(secuencia or [], start=1) if e == "Malo"]
 
 def _cd_guardadas_hoy() -> dict:
     """{ColleraID: secuencia} de lo ya guardado por este usuario en la fecha elegida
@@ -2595,62 +2737,84 @@ def _cd_guardadas_hoy() -> dict:
     guardadas.update(st.session_state.setdefault("cd_guardadas", {}).get(_cd_fecha_str(), {}))
     return guardadas
 
-def _cd_guardar_collera(collera: dict, secuencia: list):
-    """Guarda una collera completa: foto de la inspección (InspeccionColleras) + cambios
-    del historial (DurmientesEstado), en una sola operación atómica."""
-    collera_id = collera["ColleraID"]
-    fecha_str = _cd_fecha_str()
-    usuario = st.session_state.usuario
-    filas_insp = [fila_inspeccion("", fecha_str, collera, secuencia, usuario)]
-    cambios = filas_cambios_durmientes(f"CONTROL {usuario}", fecha_str, {collera_id: secuencia})
-    if guardar_bloques({"InspeccionColleras": filas_insp, "DurmientesEstado": cambios}):
-        persistir_cambios_durmientes_local(cambios)
-        st.session_state.setdefault("cd_guardadas", {}).setdefault(fecha_str, {})[collera_id] = tuple(secuencia)
-        st.session_state.cd_mensaje = ("ok", f"Collera {collera['Collera']} guardada ✅")
-    else:
-        st.session_state.cd_mensaje = ("error", f"No se pudo guardar la collera {collera['Collera']} (sin conexión). "
-                                                "Lo marcado sigue acá; toca «Reintentar guardar».")
-
-def _cd_autoguardar(collera: dict):
-    # Corre dentro de un callback: un error acá mostraría la pantalla roja antes de dibujar
-    # nada, así que se atrapa y se avisa en la misma pantalla (el borrador no se pierde).
+def _cd_info_collera(collera_id: str) -> dict | None:
     try:
-        secuencia = _cd_borrador(collera["ColleraID"])
-        if all(secuencia) and _cd_guardadas_hoy().get(collera["ColleraID"]) != tuple(secuencia):
-            _cd_guardar_collera(collera, list(secuencia))
+        pk = int(str(collera_id).split("-")[0])
+    except ValueError:
+        return None
+    return next((c for c in cargar_colleras_de_pk(pk) if c["ColleraID"] == collera_id), None)
+
+def _cd_pendiente(collera_id: str, guardadas: dict | None = None) -> bool:
+    """Se tocó la collera y lo marcado difiere de lo guardado hoy (o aún no se guarda)."""
+    borradores = st.session_state.get("cd_borradores", {})
+    if collera_id not in borradores:
+        return False
+    guardadas = _cd_guardadas_hoy() if guardadas is None else guardadas
+    return collera_id not in guardadas or _cd_malos(borradores[collera_id]) != _cd_malos(guardadas[collera_id])
+
+def _cd_secuencia_final(collera_id: str) -> list:
+    """Lo que se guarda: Malo donde se tocó; en el resto Bueno, salvo que el durmiente esté
+    registrado como Nuevo o Reemplazado (en terreno solo se marca malo/bueno: así no se
+    pierde la renovación que ya estaba registrada)."""
+    malos = set(_cd_malos(st.session_state.get("cd_borradores", {}).get(collera_id)))
+    vigente = cargar_estado_collera(collera_id)
+    return ["Malo" if p in malos else (vigente.get(p) if vigente.get(p) in ("Nuevo", "Reemplazado") else "Bueno")
+            for p in range(1, 24)]
+
+def _cd_guardar(collera_id: str) -> bool:
+    """Guarda una collera: foto de la inspección (InspeccionColleras) + cambios del
+    historial (DurmientesEstado), en una sola operación atómica. Nunca lanza excepción
+    (corre dentro de callbacks): si falla, deja un mensaje y el borrador intacto."""
+    collera = _cd_info_collera(collera_id)
+    if collera is None:
+        return False
+    try:
+        secuencia = _cd_secuencia_final(collera_id)
+        fecha_str = _cd_fecha_str()
+        usuario = st.session_state.usuario
+        filas_insp = [fila_inspeccion("", fecha_str, collera, secuencia, usuario)]
+        cambios = filas_cambios_durmientes(f"CONTROL {usuario}", fecha_str, {collera_id: secuencia})
+        if guardar_bloques({"InspeccionColleras": filas_insp, "DurmientesEstado": cambios}):
+            persistir_cambios_durmientes_local(cambios)
+            st.session_state.setdefault("cd_guardadas", {}).setdefault(fecha_str, {})[collera_id] = tuple(secuencia)
+            st.session_state.setdefault("cd_borradores", {})[collera_id] = ["Malo" if e == "Malo" else None for e in secuencia]
+            n_malos = secuencia.count("Malo")
+            st.session_state.cd_mensaje = ("ok", f"Collera {collera['Collera']} guardada ✅ ({n_malos} malo{'s' if n_malos != 1 else ''})")
+            return True
     except Exception:
         print(traceback.format_exc(), flush=True)
-        st.session_state.cd_mensaje = ("error", "No se pudo guardar esta collera ahora. Lo marcado sigue acá; "
-                                                "toca «Reintentar guardar».")
+    st.session_state.cd_mensaje = ("error", f"No se pudo guardar la collera {collera['Collera']} (sin conexión). "
+                                            "Lo marcado sigue acá: vuelve a tocar «Guardar y siguiente».")
+    return False
 
-def _cd_al_cambiar(collera: dict, pos: int):
-    _cd_borrador(collera["ColleraID"])[pos - 1] = st.session_state.get(_cd_clave(collera["ColleraID"], pos))
-    _cd_autoguardar(collera)
+def _cd_al_marcar(collera_id: str):
+    malos = set(st.session_state.get(f"cdm_{collera_id}") or [])
+    st.session_state.setdefault("cd_borradores", {})[collera_id] = ["Malo" if p in malos else None for p in range(1, 24)]
 
-def _cd_rellenar(collera: dict, modo: str):
-    borrador = _cd_borrador(collera["ColleraID"])
-    if modo == "buenos":
-        borrador[:] = [e or "Bueno" for e in borrador]
-    elif modo == "ultimo":
-        vigente = cargar_estado_collera(collera["ColleraID"])
-        borrador[:] = [vigente.get(p) for p in range(1, 24)]
-    elif modo == "limpiar":
-        borrador[:] = [None] * 23
-    if modo != "limpiar":
-        _cd_autoguardar(collera)
+def _cd_ir_a(ids: list, destino: int):
+    if 0 <= destino < len(ids):
+        st.session_state.cd_sel = ids[destino]
+        st.session_state.cd_sel_mem = ids[destino]
 
-def _cd_mover(ids: list, actual: str, paso: int):
-    i = ids.index(actual) + paso
-    if 0 <= i < len(ids):
-        st.session_state.cd_sel = ids[i]
+def _cd_anterior(ids: list, actual: str):
+    if _cd_pendiente(actual):
+        _cd_guardar(actual)  # al salir de una collera con cambios, se guarda sola
+    _cd_ir_a(ids, ids.index(actual) - 1)
+
+def _cd_guardar_y_siguiente(ids: list, actual: str):
+    st.session_state.setdefault("cd_borradores", {}).setdefault(actual, [None] * 23)  # sin toques = todos Bueno
+    if not _cd_pendiente(actual) or _cd_guardar(actual):
+        _cd_ir_a(ids, ids.index(actual) + 1)
+
+def _cd_al_elegir_collera():
+    anterior = st.session_state.get("cd_sel_mem")
+    if anterior and anterior != st.session_state.get("cd_sel") and _cd_pendiente(anterior):
+        _cd_guardar(anterior)
+    st.session_state.cd_sel_mem = st.session_state.get("cd_sel")
 
 def page_control_durmientes_terreno():
     app_header("Control de Durmientes", back_page="Inicio")
     perfil_bar()
-    st.caption(
-        "Elige el PK y marca cada collera (D1 a D23). **Cada collera se guarda sola al "
-        "completar sus 23 durmientes.**"
-    )
 
     # Streamlit borra el valor de los widgets al salir de la pantalla: se recuerda aparte
     # (en *_mem) para que al volver siga en el mismo PK, collera y fecha.
@@ -2661,7 +2825,7 @@ def page_control_durmientes_terreno():
     with c1:
         pk = st.number_input("PK", min_value=33, max_value=61, step=1, key="cd_pk")
     with c2:
-        st.date_input("Fecha de inspección", key="cd_fecha")
+        st.date_input("Fecha", key="cd_fecha")
     st.session_state.cd_pk_mem = int(pk)
     st.session_state.cd_fecha_mem = st.session_state.cd_fecha
     colleras_pk = cargar_colleras_de_pk(int(pk))
@@ -2673,89 +2837,96 @@ def page_control_durmientes_terreno():
     guardadas = _cd_guardadas_hoy()
 
     def estado_txt(cid):
-        borrador = st.session_state.get("cd_borradores", {}).get(cid, [None] * 23)
-        if guardadas.get(cid) is not None and (not any(borrador) or tuple(borrador) == guardadas[cid]):
-            return "✅"
-        n = sum(1 for e in borrador if e)
-        return f"📝 {n}/23" if n else "⬜"
+        if _cd_pendiente(cid, guardadas):
+            return "📝"
+        return "✅" if cid in guardadas else "⬜"
 
     n_guardadas = sum(1 for cid in ids if cid in guardadas)
-    st.progress(n_guardadas / len(ids), text=f"PK {pk}: {n_guardadas} de {len(ids)} colleras guardadas el {_cd_fecha_str()}")
+    st.progress(n_guardadas / len(ids), text=f"PK {pk}: {n_guardadas} de {len(ids)} colleras guardadas")
 
     if st.session_state.get("cd_sel") not in por_id:
         st.session_state.cd_sel = ids[0]
     # El texto de cada opción debe ser FIJO: si cambia (p.ej. mostrando el avance ✅/📝),
-    # Streamlit lo toma como otro widget y vuelve a la primera collera. El avance va aparte.
+    # Streamlit lo toma como otro widget y vuelve a la primera collera.
     collera_id = st.selectbox(
-        "Collera", ids, key="cd_sel",
+        "Collera", ids, key="cd_sel", on_change=_cd_al_elegir_collera,
         format_func=lambda cid: (f"Collera {por_id[cid]['Collera']} · km {por_id[cid]['KmDesde']:.3f}–"
                                  f"{por_id[cid]['KmHasta']:.3f} · {por_id[cid]['Ubicacion']}"),
     )
     collera = por_id[collera_id]
     st.session_state.cd_sel_mem = collera_id
-    pendientes = [por_id[cid]["Collera"] for cid in ids if estado_txt(cid) != "✅"]
-    st.caption(f"Esta collera: **{estado_txt(collera_id)}** · Pendientes en el PK: "
-               + (", ".join(str(n) for n in pendientes[:15]) + (" …" if len(pendientes) > 15 else "") if pendientes else "ninguna 🎉"))
-    n1, n2 = st.columns(2)
-    with n1:
-        st.button("‹ Anterior", key="cd_anterior", on_click=_cd_mover, args=(ids, collera_id, -1),
-                  disabled=ids.index(collera_id) == 0, width="stretch")
-    with n2:
-        st.button("Siguiente ›", key="cd_siguiente", on_click=_cd_mover, args=(ids, collera_id, 1),
-                  disabled=ids.index(collera_id) == len(ids) - 1, width="stretch")
 
     mensaje = st.session_state.pop("cd_mensaje", None)
     if mensaje:
         (st.success if mensaje[0] == "ok" else st.error)(mensaje[1])
 
-    borrador = _cd_borrador(collera_id)
-    if not any(borrador) and guardadas.get(collera_id):
-        borrador[:] = list(guardadas[collera_id])  # reabrir lo ya guardado hoy para corregirlo
-    vigente = cargar_estado_collera(collera_id)
-    st.caption(f"Último estado registrado: {franja_durmientes([vigente.get(p) for p in range(1, 24)])}")
-
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        st.button("✅ Vacíos = Bueno", key="cd_buenos", on_click=_cd_rellenar, args=(collera, "buenos"), width="stretch")
-    with b2:
-        st.button("↩️ Copiar último", key="cd_ultimo", on_click=_cd_rellenar, args=(collera, "ultimo"), width="stretch")
-    with b3:
-        st.button("🧹 Limpiar", key="cd_limpiar", on_click=_cd_rellenar, args=(collera, "limpiar"), width="stretch")
-
-    for pos in range(1, 24):
-        clave = _cd_clave(collera_id, pos)
-        st.session_state[clave] = borrador[pos - 1]
-        st.segmented_control(
-            f"D{pos}", ESTADOS_DURMIENTE, format_func=ETIQUETA_ESTADO.get, key=clave,
-            on_change=_cd_al_cambiar, args=(collera, pos),
+    # Lo marcado: el borrador si se tocó; si no, lo guardado hoy; si no, todo Bueno.
+    borrador = st.session_state.get("cd_borradores", {}).get(collera_id)
+    malos = _cd_malos(borrador if borrador is not None else guardadas.get(collera_id))
+    clave_pills = f"cdm_{collera_id}"
+    st.session_state[clave_pills] = malos
+    with st.container(key="cd_pills_box"):
+        st.pills(
+            f"Toca los durmientes **MALOS** de la collera {collera['Collera']} (los demás quedan Buenos)",
+            list(range(1, 24)), selection_mode="multi", key=clave_pills,
+            on_change=_cd_al_marcar, args=(collera_id,),
         )
 
-    secuencia = list(borrador)
-    ev = evaluar_secuencia(secuencia, collera["Ubicacion"])
-    marcados = sum(1 for e in secuencia if e)
-    st.markdown(f"**D1 → D23:** {franja_durmientes(secuencia)}")
-    st.caption("🟩 Bueno · 🟥 Malo · 🟦 Nuevo · 🟪 Reemplazado · ⬜ sin marcar")
-    if marcados < 23:
-        st.info(f"{marcados}/23 durmientes marcados. Completa los 23 y la collera se guarda sola.")
-    elif guardadas.get(collera_id) == tuple(secuencia):
-        st.success(f"Collera {collera['Collera']} guardada ✅")
+    # Los botones van justo bajo los números: en un celular chico no quedan tapados por la barra inferior.
+    posicion = ids.index(collera_id)
+    with st.container(key="cd_nav"):
+        n1, n2 = st.columns([1, 2])
+        with n1:
+            st.button("‹", key="cd_anterior", on_click=_cd_anterior, args=(ids, collera_id),
+                      disabled=posicion == 0, width="stretch")
+        with n2:
+            es_ultima = posicion == len(ids) - 1
+            st.button("💾 Guardar" if es_ultima else "💾 Guardar y siguiente ›", key="cd_siguiente",
+                      on_click=_cd_guardar_y_siguiente, args=(ids, collera_id), width="stretch")
+
+    secuencia = _cd_secuencia_final(collera_id) if borrador is not None else (
+        list(guardadas[collera_id]) if collera_id in guardadas else _cd_secuencia_final(collera_id))
+    if borrador is None and collera_id not in guardadas:
+        st.caption("⬜ Sin revisar. Si está toda buena, solo toca «Guardar y siguiente».")
     else:
-        st.warning("La collera está completa pero aún no se guarda.")
-        st.button("💾 Reintentar guardar", key="cd_reintentar", on_click=_cd_autoguardar, args=(collera,))
-    badge(ev["estado_general"], TIPO_BADGE_ESTADO.get(ev["estado_general"], "info"))
-    st.dataframe(tabla_indicadores_collera(ev), hide_index=True, width="stretch")
+        ev = evaluar_secuencia(secuencia, collera["Ubicacion"])
+        badge(ev["estado_general"], TIPO_BADGE_ESTADO.get(ev["estado_general"], "info"))
+        st.dataframe(tabla_indicadores_collera(ev), hide_index=True, width="stretch")
 
     with st.expander(f"📋 Resumen del PK {pk}"):
         filas = []
         for cid in ids:
             c = por_id[cid]
-            seq = st.session_state.get("cd_borradores", {}).get(cid)
-            if not seq or not any(seq):
-                seq = list(guardadas.get(cid) or [None] * 23)
-            ev_c = evaluar_secuencia(seq, c["Ubicacion"])
-            filas.append({"Collera": c["Collera"], "Avance": estado_txt(cid), "D1 → D23": franja_durmientes(seq),
-                          "Estado": ev_c["estado_general"] if any(seq) else "—"})
+            b = st.session_state.get("cd_borradores", {}).get(cid)
+            seq = b if b is not None else guardadas.get(cid)
+            filas.append({"Collera": c["Collera"], "": estado_txt(cid),
+                          "Malos": ", ".join(str(p) for p in _cd_malos(seq)) if seq is not None else "—",
+                          "Estado": evaluar_secuencia(list(guardadas[cid]), c["Ubicacion"])["estado_general"]
+                          if cid in guardadas and not _cd_pendiente(cid, guardadas) else "—"})
         st.dataframe(pd.DataFrame(filas), hide_index=True, width="stretch")
+        st.caption("✅ guardada · 📝 con cambios sin guardar · ⬜ pendiente")
+
+    # Descarga de la ficha del PK (lo guardado en la fecha elegida), con el formato de la ficha de papel.
+    st.markdown(f"##### ⬇️ Ficha del PK {pk}")
+    clave_ficha = f"ficha_{pk}_{_cd_fecha_str()}"
+    if st.button("📄 Preparar ficha (PDF y Excel)", key="cd_preparar_ficha", width="stretch"):
+        inspeccionadas = {cid: guardadas[cid] for cid in ids if cid in guardadas}
+        st.session_state[clave_ficha] = (
+            generar_pdf_ficha_durmientes(int(pk), _cd_fecha_str(), colleras_pk, inspeccionadas, st.session_state.usuario),
+            generar_excel_ficha_durmientes(int(pk), _cd_fecha_str(), colleras_pk, inspeccionadas),
+        )
+    ficha = st.session_state.get(clave_ficha)
+    if ficha:
+        if any(_cd_pendiente(cid, guardadas) for cid in ids):
+            st.caption("📝 Hay colleras con cambios sin guardar: guárdalas y vuelve a preparar la ficha para incluirlas.")
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button("📄 PDF", data=ficha[0], file_name=f"Ficha_Durmientes_PK{pk}_{_cd_fecha_str()}.pdf",
+                               mime="application/pdf", key="cd_descargar_pdf", width="stretch")
+        with d2:
+            st.download_button("📊 Excel", data=ficha[1], file_name=f"Ficha_Durmientes_PK{pk}_{_cd_fecha_str()}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="cd_descargar_excel", width="stretch")
 
 def render_equipos_section():
     st.caption("Marca los equipos utilizados durante la jornada e indica la cantidad.")
