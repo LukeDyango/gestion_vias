@@ -68,6 +68,9 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
     div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 100% !important; flex: 1 1 100% !important; }
     .st-key-bottom_nav div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 0 !important; flex: 1 1 0 !important; }
     .st-key-header_row div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 0 !important; }
+    [class*="st-key-otbtns_"] div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
+    [class*="st-key-otbtns_"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 0 !important; flex: 1 1 0 !important; }
+    [class*="st-key-otbtns_"] button { padding: 0.5rem 0.2rem !important; font-size: 13px !important; }
     .st-key-cd_nav div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
     .st-key-cd_nav div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 0 !important; }
     .st-key-cd_nav div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:first-child { flex: 1 1 0 !important; }
@@ -155,9 +158,20 @@ AVISO_COLUMNS = [
     "AprobadoADI", "ObsADI", "FechaValADI", "RespValADI",
     "AprobadoEFE", "ObsEFE", "FechaValEFE", "RespValEFE",
     "AprobadoSubcontrato", "ObsSubcontrato", "FechaValSubcontrato", "RespValSubcontrato",
+    "ObsCierre", "FechaCierre", "CerradoPor",
 ]
 
-OTS_COLUMNS = ["OTID", "AvisoID", "Activo", "Responsable", "FechaProgramada", "EstadoOT"]
+OTS_COLUMNS = ["OTID", "AvisoID", "Activo", "Responsable", "FechaProgramada", "EstadoOT", "FechaCierre", "CerradoPor"]
+
+# Bitácora de cada OT (solo se agregan filas, nunca se borran): qué pasó, qué se hizo y qué
+# queda pendiente en cada paso, con evidencia. Sirve para diagnosticar, decidir y mantener.
+OT_HISTORIAL_COLUMNS = ["OTID", "AvisoID", "FechaHora", "Usuario", "Perfil", "Accion", "EstadoOT",
+                        "QuePaso", "QueSeHizo", "Pendiente", "Fotos"]
+# Quién puede cerrar una OT: el cliente. De momento Sacyr, ADI (ITO) y EFE (no el Subcontrato).
+ROLES_CIERRAN_OT = ["Sacyr", "ADI (ITO)", "EFE"]
+# Responsables de OT (uno por institución). ADI (ITO): "Juan Pérez" es un nombre de EJEMPLO
+# puesto a pedido del usuario, hasta que confirme el nombre real.
+RESPONSABLES_OT = ["Hugo Dantas (Sacyr)", "Juan Pérez (ADI)", "Mauricio Badilla (EFE)"]
 
 # Control de Durmientes por Collera (Norma NS-01-01-00)
 COLLERAS_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "colleras_catalogo.csv")
@@ -223,6 +237,9 @@ def init_db():
         "ObsSubcontrato": "TEXT DEFAULT ''",
         "FechaValSubcontrato": "TEXT DEFAULT ''",
         "RespValSubcontrato": "TEXT DEFAULT ''",
+        "ObsCierre": "TEXT DEFAULT ''",
+        "FechaCierre": "TEXT DEFAULT ''",
+        "CerradoPor": "TEXT DEFAULT ''",
     }
     for col, decl in columnas_nuevas.items():
         if col not in cols_existentes:
@@ -343,6 +360,9 @@ def load_avisos(estricto: bool = False):
         conn = get_db()
         df = pd.read_sql("SELECT * FROM avisos", conn)
         conn.close()
+    for col in AVISO_COLUMNS:  # avisos guardados antes de agregar columnas nuevas (p.ej. ObsCierre)
+        if col not in df.columns:
+            df[col] = ""
     for col in ["OT_Creada", "AprobadoSacyr", "AprobadoADI", "AprobadoEFE", "AprobadoSubcontrato"]:
         df[col] = df[col].apply(_a_bool)
     df["RolFinal"] = df["RolFinal"].fillna("EFE").replace("", "EFE")
@@ -361,13 +381,16 @@ def load_ots(estricto: bool = False):
         conn = get_db()
         df = pd.read_sql("SELECT * FROM ots", conn)
         conn.close()
+    for col in OTS_COLUMNS:  # OTs guardadas antes de agregar columnas nuevas (FechaCierre, CerradoPor)
+        if col not in df.columns:
+            df[col] = ""
     return df
 
 def save_all_avisos():
     df = st.session_state.avisos.copy()
     for col in ["OT_Creada", "AprobadoSacyr", "AprobadoADI", "AprobadoEFE", "AprobadoSubcontrato"]:
-        df[col] = df[col].astype(int)
-    df = df[AVISO_COLUMNS]
+        df[col] = df[col].apply(_a_bool).astype(int)
+    df = df.reindex(columns=AVISO_COLUMNS).fillna("")
     conn = get_db()
     df.to_sql("avisos", conn, if_exists="replace", index=False)
     conn.commit()
@@ -375,9 +398,7 @@ def save_all_avisos():
     _sincronizar_tabla_sheets("Avisos", df.values.tolist())
 
 def save_all_ots():
-    df = st.session_state.ots.copy()
-    if not df.empty:
-        df = df[OTS_COLUMNS]
+    df = st.session_state.ots.copy().reindex(columns=OTS_COLUMNS).fillna("")
     conn = get_db()
     df.to_sql("ots", conn, if_exists="replace", index=False)
     conn.commit()
@@ -671,6 +692,7 @@ REPORTES_SHEETS = {
     "OTs": OTS_COLUMNS,
     "DurmientesEstado": DURMIENTES_COLUMNS,
     "InspeccionColleras": INSPECCION_COLUMNS,
+    "OTHistorial": OT_HISTORIAL_COLUMNS,
 }
 
 DIAS_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
@@ -1508,7 +1530,7 @@ def generar_pdf_ficha_durmientes(pk: int, fecha_str: str, colleras_pk: list, ins
 
     def encabezado():
         t = Table([
-            [Paragraph("SD", est["etq"]), "", Paragraph("FICHA DE DURMIENTES", est["tit"]), Paragraph("icil-icafal", est["marca"])],
+            [Paragraph("SD", est["etq"]), "", Paragraph("FICHA DE DURMIENTES", est["tit"]), Paragraph("SACYR", est["marca"])],
             [Paragraph("PK", est["etq"]), Paragraph(str(pk), est["val"]),
              Paragraph(f"FECHA&nbsp;&nbsp;<b>{fecha_txt}</b>", ParagraphStyle("f_fecha", fontName="Helvetica", fontSize=9, alignment=1)), ""],
         ], colWidths=[1.0 * cm, 2.2 * cm, ancho_util - 7.2 * cm, 4.0 * cm], rowHeights=[0.6 * cm, 0.6 * cm])
@@ -1789,6 +1811,21 @@ def generar_respaldo_plano() -> bytes | None:
     df_insp = _leer_hoja_df("InspeccionColleras")
     if not df_insp.empty:
         hoja_excel_durmientes(wb, colleras_desde_inspecciones(df_insp), con_reporte=True)
+
+    # OTs y su bitácora (qué pasó, qué se hizo, qué queda pendiente en cada paso).
+    for titulo, df_hoja, columnas, anchos in (
+        ("OTs", st.session_state.get("ots", pd.DataFrame()), OTS_COLUMNS, [11, 11, 30, 18, 16, 13, 16, 18]),
+        ("Bitácora OTs", _leer_hoja_df("OTHistorial"), OT_HISTORIAL_COLUMNS, [11, 11, 16, 18, 14, 18, 13, 40, 40, 40, 30]),
+    ):
+        if df_hoja is not None and not df_hoja.empty:
+            ws_h = wb.create_sheet(titulo)
+            ws_h.append(columnas)
+            for fila in df_hoja.reindex(columns=columnas).fillna("").values.tolist():
+                ws_h.append(fila)
+            for celda in ws_h[1]:
+                celda.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
+                celda.fill = openpyxl.styles.PatternFill("solid", fgColor="0B3B8A")
+            _ajustar_anchos_columnas(ws_h, anchos)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -3510,6 +3547,19 @@ def terreno_mis_avisos():
             obs = row["ObsSacyr"] or row["ObsADI"] or row["ObsEFE"] or row.get("ObsSubcontrato", "")
             if obs:
                 st.warning(f"Observación: {obs}")
+        if row["Estado"] == "Rechazado":
+            motivo = row["ObsSacyr"] or row["ObsADI"] or row["ObsEFE"] or row.get("ObsSubcontrato", "")
+            if motivo:
+                st.caption(f"⛔ Motivo: {motivo}")
+        # Seguimiento de la OT de la incidencia: en qué va y, al cerrarse, qué se hizo.
+        for _, ot_r in st.session_state.ots[st.session_state.ots["AvisoID"] == row["AvisoID"]].iterrows():
+            if ot_r["EstadoOT"] == "Cerrada":
+                st.caption(f"🔧 {ot_r['OTID']} cerrada el {ot_r.get('FechaCierre', '')}")
+            else:
+                pendiente = ultimo_pendiente_ot(ot_r["OTID"])
+                st.caption(f"🔧 {ot_r['OTID']} · {ot_r['EstadoOT']}" + (f" · ⏳ {pendiente}" if pendiente else ""))
+        if row["Estado"] == "Cerrado" and isinstance(row.get("ObsCierre"), str) and row["ObsCierre"].strip():
+            st.caption(f"🔒 {row['ObsCierre']}")
 
 def flujo_terreno():
     page = st.session_state.page
@@ -3778,12 +3828,25 @@ def validador_detalle():
         row = df[df["AvisoID"] == aviso_id].iloc[0].to_dict()
 
         if row["OT_Creada"]:
-            st.info("Este aviso ya tiene una OT asociada. Ve a Backlog de OTs.")
+            ots_aviso = st.session_state.ots[st.session_state.ots["AvisoID"] == aviso_id]
+            if ots_aviso.empty:
+                st.info("Este aviso ya tiene una OT asociada. Ve a Backlog de OTs.")
+            for _, ot_r in ots_aviso.iterrows():
+                c1, c2 = st.columns([3, 2])
+                with c1:
+                    st.markdown(f"**{ot_r['OTID']}** · Responsable: {ot_r['Responsable']}")
+                with c2:
+                    badge(ot_r["EstadoOT"], ESTADO_KIND_OT.get(ot_r["EstadoOT"], "info"))
+                with st.expander(f"📜 Bitácora de {ot_r['OTID']}", expanded=True):
+                    mostrar_bitacora_ot(ot_r["OTID"], f"bitav_{ot_r['OTID']}")
+            if st.button("🔧 Ir a Backlog de OTs", key="btn_ir_ots"):
+                st.session_state.page = "OTs"
+                st.rerun()
         elif row["Estado"] != "Validado":
             st.info(f"⚠️ Para crear OT, el Aviso debe estar **Validado** (Sacyr → ADI → {rol_final}).")
         else:
             with st.form("form_ot"):
-                responsable = st.selectbox("Responsable", ["Camila Pérez", "Jefe Mantenimiento", "Planner", "Técnico 1"])
+                responsable = st.selectbox("Responsable", RESPONSABLES_OT)
                 fecha_prog_d = st.date_input("Fecha Programada (día)", datetime.now().date())
                 fecha_prog_t = st.time_input("Hora Programada", datetime.now().time().replace(second=0, microsecond=0))
                 submitted_ot = st.form_submit_button("Iniciar OT", key="btn_iniciar_ot")
@@ -3791,7 +3854,11 @@ def validador_detalle():
                 fecha_prog = datetime.combine(fecha_prog_d, fecha_prog_t)
                 ot_id = next_ot_id()
                 new_ot = {"OTID": ot_id, "AvisoID": row["AvisoID"], "Activo": row["Activo"],
-                          "Responsable": responsable, "FechaProgramada": fecha_prog.strftime("%Y-%m-%d %H:%M"), "EstadoOT": "Programada"}
+                          "Responsable": responsable, "FechaProgramada": fecha_prog.strftime("%Y-%m-%d %H:%M"),
+                          "EstadoOT": "Programada", "FechaCierre": "", "CerradoPor": ""}
+                registrar_en_bitacora(new_ot, "Creada", "Programada",
+                                      que_paso=f"Aviso {row['AvisoID']}: {row['Descripcion']} ({row['Prioridad']}, {row['Tipificacion']})",
+                                      pendiente=f"Ejecutar el trabajo · responsable {responsable} · programada {fecha_prog:%d-%m-%Y %H:%M}")
                 st.session_state.ots = pd.concat([st.session_state.ots, pd.DataFrame([new_ot])], ignore_index=True)
                 st.session_state.avisos.loc[df["AvisoID"] == row["AvisoID"], "OT_Creada"] = True
                 st.session_state.avisos.loc[df["AvisoID"] == row["AvisoID"], "Estado"] = "OT creada"
@@ -3801,47 +3868,231 @@ def validador_detalle():
                 st.session_state.page = "OTs"
                 st.rerun()
 
-        st.write("")
-        if st.button("✅ Cerrar Aviso", key="btn_cerrar"):
-            st.session_state.avisos.loc[st.session_state.avisos["AvisoID"] == aviso_id, "Estado"] = "Cerrado"
-            save_all_avisos()
-            st.success("Aviso cerrado.")
+        # Cierre del aviso: si tiene OT, se cierra solo al cerrar la OT (con su bitácora). Sin OT
+        # (p.ej. el aviso de un Reporte Diario ya validado), lo cierra el cliente con un comentario.
+        if row["Estado"] == "Cerrado" and row.get("ObsCierre"):
+            st.caption(f"🔒 Cerrado {row.get('FechaCierre', '')} por {row.get('CerradoPor', '')}: {row['ObsCierre']}")
+        elif row["Estado"] == "Validado" and not row["OT_Creada"] and role in ROLES_CIERRAN_OT:
+            st.write("")
+            with st.expander("🔒 Cerrar aviso sin OT"):
+                motivo = st.text_area("¿Por qué se cierra sin OT? *", key=f"motivo_cierre_{aviso_id}", height=70,
+                                      placeholder="Ej: reporte diario revisado y conforme, no requiere trabajos")
+                if st.button("✅ Cerrar Aviso", key="btn_cerrar"):
+                    if not motivo.strip():
+                        st.error("Escribe el motivo del cierre.")
+                    else:
+                        mascara = st.session_state.avisos["AvisoID"] == aviso_id
+                        st.session_state.avisos.loc[mascara, ["Estado", "ObsCierre", "FechaCierre", "CerradoPor"]] = [
+                            "Cerrado", motivo.strip(), now_str(), st.session_state.usuario]
+                        save_all_avisos()
+                        st.rerun()
 
     if tab_reporte is not None:
         with tab_reporte:
             st.caption("Solo lectura — esto es exactamente lo que ingresó Personal de Terreno.")
             mostrar_detalle_reporte_diario(row["ReporteID"])
 
+# -------------------------
+# Bitácora de OTs
+# -------------------------
+ESTADO_KIND_OT = {"Programada": "info", "En ejecución": "warn", "Cerrada": "muted"}
+ICONO_ACCION_OT = {"Creada": "🆕", "Inicio de ejecución": "▶️", "Avance": "📝", "Cierre": "✅"}
+
+def historial_ot(ot_id: str) -> pd.DataFrame:
+    df = _leer_hoja_df("OTHistorial")
+    if df.empty:
+        return pd.DataFrame(columns=OT_HISTORIAL_COLUMNS)
+    df = df[df["OTID"].astype(str) == str(ot_id)].copy()
+    df["_orden"] = range(len(df))
+    return df.sort_values(["FechaHora", "_orden"]).drop(columns="_orden")
+
+def _guardar_fotos_evidencia(carpeta_id: str, prefijo: str, archivos) -> list:
+    """Guarda fotos de evidencia (comprimidas, igual que las del Reporte Diario) en el disco y
+    las respalda en Google Sheets (FotosData) para que sobrevivan a un reinicio."""
+    guardadas = []
+    if not archivos:
+        return guardadas
+    carpeta = os.path.join(FOTOS_DIR, carpeta_id)
+    os.makedirs(carpeta, exist_ok=True)
+    marca = datetime.now().strftime("%Y%m%d%H%M%S")
+    for i, archivo in enumerate(archivos, start=1):
+        nombre = f"{prefijo}_{marca}_{i:02d}.jpg"
+        ruta = os.path.join(carpeta, nombre)
+        try:
+            img = ImageOps.exif_transpose(PILImage.open(archivo)).convert("RGB")
+            img.thumbnail((FOTO_MAX_LADO, FOTO_MAX_LADO))
+            img.save(ruta, format="JPEG", quality=FOTO_CALIDAD, optimize=True)
+        except Exception:
+            with open(ruta, "wb") as f:
+                f.write(archivo.getbuffer())
+        guardadas.append((nombre, ruta))
+    _respaldar_fotos_sheets(carpeta_id, guardadas)
+    return guardadas
+
+def registrar_en_bitacora(ot: dict, accion: str, estado_ot: str, que_paso: str = "", que_se_hizo: str = "",
+                          pendiente: str = "", fotos=None) -> bool:
+    """Agrega un registro a la bitácora de la OT (nunca se sobrescribe ni se borra)."""
+    nombres = [n for n, _ in _guardar_fotos_evidencia(str(ot["OTID"]), accion.split()[0].lower(), fotos)]
+    fila = [ot["OTID"], ot["AvisoID"], now_str(), st.session_state.usuario, st.session_state.perfil, accion,
+            estado_ot, que_paso.strip(), que_se_hizo.strip(), pendiente.strip(), ", ".join(nombres)]
+    return guardar_bloques({"OTHistorial": [fila]})
+
+def mostrar_bitacora_ot(ot_id: str, clave: str):
+    """Línea de tiempo de la OT: qué pasó, qué se hizo, qué queda pendiente, con fotos."""
+    df = historial_ot(ot_id)
+    if df.empty:
+        st.caption("Sin registros en la bitácora todavía.")
+        return
+    for _, h in df.iterrows():
+        icono = ICONO_ACCION_OT.get(str(h["Accion"]), "•")
+        st.markdown(f"{icono} **{h['Accion']}** · {h['FechaHora']} · {h['Usuario']} ({h['Perfil']}) · estado: {h['EstadoOT']}")
+        for etiqueta, campo in (("Qué pasó", "QuePaso"), ("Qué se hizo", "QueSeHizo"), ("Pendiente", "Pendiente")):
+            valor = h.get(campo)
+            if isinstance(valor, str) and valor.strip():
+                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;*{etiqueta}:* {valor}")
+        fotos = [n.strip() for n in str(h.get("Fotos") or "").split(",") if n.strip()]
+        if fotos:
+            _restaurar_fotos_desde_sheets([(ot_id, n) for n in fotos])
+            cols = st.columns(min(len(fotos), 3))
+            for i, n in enumerate(fotos):
+                ruta = _ubicar_foto(ot_id, n)
+                with cols[i % len(cols)]:
+                    if ruta:
+                        st.image(ruta, width="stretch")
+                    else:
+                        st.caption(f"(foto no disponible: {n})")
+
+def ultimo_pendiente_ot(ot_id: str) -> str:
+    """Lo pendiente según el último avance/cierre. El pendiente de la creación («Ejecutar el
+    trabajo…») solo vale mientras la OT no haya tenido otro movimiento."""
+    df = historial_ot(ot_id)
+    for i, (_, h) in enumerate(reversed(list(df.iterrows()))):
+        valor = h.get("Pendiente")
+        if isinstance(valor, str) and valor.strip():
+            if h.get("Accion") == "Creada" and i > 0:
+                return ""
+            return valor.strip()
+    return ""
+
+def _form_bitacora_ot(ot: dict, tipo: str):
+    """Formulario de Avance o Cierre. En el cierre, las tres preguntas son obligatorias:
+    deja evidencia de qué pasó, qué se hizo y qué queda, para decidir y mantener mañana."""
+    ot_id = ot["OTID"]
+    cierre = tipo == "cierre"
+    with st.form(f"form_{tipo}_{ot_id}", clear_on_submit=True):
+        st.markdown(f"**{'✅ Cerrar' if cierre else '📝 Registrar avance de'} {ot_id}**")
+        que_paso = st.text_area("¿Qué pasó? (diagnóstico / causa encontrada)" + (" *" if cierre else ""), height=70,
+                                placeholder="Ej: riel con fisura transversal por fatiga en junta")
+        que_se_hizo = st.text_area("¿Qué se hizo?" + " *", height=70,
+                                   placeholder="Ej: se reemplazó 1 tramo de riel de 12 m y 4 eclisas")
+        pendiente = st.text_area("¿Qué queda pendiente?" + (" *" if cierre else ""), height=60,
+                                 placeholder="Ej: revisar nivelación en 30 días · o «Nada pendiente»")
+        fotos = st.file_uploader("Fotos de evidencia (opcional)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            enviar = st.form_submit_button("💾 Guardar cierre" if cierre else "💾 Guardar avance", width="stretch")
+        with c2:
+            cancelar = st.form_submit_button("Cancelar", width="stretch")
+    if cancelar:
+        st.session_state.ot_form = None
+        st.rerun()
+    if not enviar:
+        return
+    faltan = [n for n, v in (("qué se hizo", que_se_hizo),) if not v.strip()]
+    if cierre:
+        faltan = [n for n, v in (("qué pasó", que_paso), ("qué se hizo", que_se_hizo), ("qué queda pendiente", pendiente)) if not v.strip()]
+    if faltan:
+        st.error(f"Falta completar: {', '.join(faltan)}.")
+        return
+    nuevo_estado = "Cerrada" if cierre else ot["EstadoOT"]
+    if not registrar_en_bitacora(ot, "Cierre" if cierre else "Avance", nuevo_estado, que_paso, que_se_hizo, pendiente, fotos):
+        st.error("No se pudo guardar en Google Sheets (sin conexión). Intenta de nuevo.")
+        return
+    if cierre:
+        mascara_ot = st.session_state.ots["OTID"] == ot_id
+        st.session_state.ots.loc[mascara_ot, ["EstadoOT", "FechaCierre", "CerradoPor"]] = ["Cerrada", now_str(), st.session_state.usuario]
+        save_all_ots()
+        # Al cerrar la OT se cierra su aviso, con el resumen del cierre como observación.
+        mascara_av = st.session_state.avisos["AvisoID"] == ot["AvisoID"]
+        st.session_state.avisos.loc[mascara_av, ["Estado", "ObsCierre", "FechaCierre", "CerradoPor"]] = [
+            "Cerrado", f"OT {ot_id} cerrada. Qué se hizo: {que_se_hizo.strip()} · Pendiente: {pendiente.strip()}",
+            now_str(), st.session_state.usuario]
+        save_all_avisos()
+    st.session_state.ot_form = None
+    st.session_state.ot_mensaje = f"{ot_id}: {'OT cerrada y aviso cerrado' if cierre else 'avance registrado'} ✅"
+    st.rerun()
+
+def tarjeta_ot(r: dict):
+    ot_id = r["OTID"]
+    perfil = st.session_state.perfil
+    with st.container(border=True):
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            st.markdown(f"**{ot_id}** · {r['Activo']}")
+        with c2:
+            badge(r["EstadoOT"], ESTADO_KIND_OT.get(r["EstadoOT"], "info"))
+        st.caption(f"Aviso {r['AvisoID']} · Responsable: {r['Responsable']} · Programada: {r['FechaProgramada']}"
+                   + (f" · Cerrada {r['FechaCierre']} por {r['CerradoPor']}" if r["EstadoOT"] == "Cerrada" and r.get("FechaCierre") else ""))
+        pendiente = ultimo_pendiente_ot(ot_id)
+        if pendiente and r["EstadoOT"] != "Cerrada":
+            st.caption(f"⏳ Pendiente: {pendiente}")
+
+        if st.session_state.get("ot_form") and st.session_state.ot_form[0] == ot_id:
+            _form_bitacora_ot(r, st.session_state.ot_form[1])
+        elif r["EstadoOT"] != "Cerrada":
+            b1, b2, b3 = st.container(key=f"otbtns_{ot_id}").columns(3)
+            with b1:
+                if r["EstadoOT"] == "Programada":
+                    if st.button("▶ Iniciar", key=f"exec_{ot_id}", width="stretch"):
+                        if registrar_en_bitacora(r, "Inicio de ejecución", "En ejecución"):
+                            st.session_state.ots.loc[st.session_state.ots["OTID"] == ot_id, "EstadoOT"] = "En ejecución"
+                            save_all_ots()
+                        st.rerun()
+                else:
+                    if st.button("📝 Avance", key=f"avance_{ot_id}", width="stretch"):
+                        st.session_state.ot_form = (ot_id, "avance")
+                        st.rerun()
+            with b2:
+                if st.button("✅ Cerrar", key=f"close_{ot_id}", width="stretch", disabled=perfil not in ROLES_CIERRAN_OT,
+                             help=None if perfil in ROLES_CIERRAN_OT else "La OT la cierra el cliente (Sacyr, ADI o EFE)."):
+                    st.session_state.ot_form = (ot_id, "cierre")
+                    st.rerun()
+            with b3:
+                if st.button("🧾 Aviso", key=f"seeav_{ot_id}", width="stretch"):
+                    st.session_state.selected_aviso = r["AvisoID"]
+                    st.session_state.page = "Detalle"
+                    st.rerun()
+        else:
+            if st.button("🧾 Ver aviso", key=f"seeav_{ot_id}"):
+                st.session_state.selected_aviso = r["AvisoID"]
+                st.session_state.page = "Detalle"
+                st.rerun()
+        with st.expander(f"📜 Bitácora de {ot_id}"):
+            mostrar_bitacora_ot(ot_id, f"bit_{ot_id}")
+
 def validador_ots():
     app_header("Backlog de OTs", back_page="Inicio", right_icon="📊")
     perfil_bar()
+    mensaje = st.session_state.pop("ot_mensaje", None)
+    if mensaje:
+        st.success(mensaje)
     df = st.session_state.ots.copy()
     if df.empty:
         st.info("Aún no hay OTs. Crea una desde un Aviso validado.")
         return
-    estado_kind = {"Programada": "info", "En ejecución": "warn", "Cerrada": "muted"}
-    for _, r in df.iterrows():
-        st.markdown(f"**{r['OTID']}**")
-        badge(r["EstadoOT"], estado_kind.get(r["EstadoOT"], "info"))
-        st.write(f"Activo: {r['Activo']}")
-        st.caption(f"Aviso: {r['AvisoID']} · Responsable: {r['Responsable']} · Programada: {r['FechaProgramada']}")
-        cols = st.columns(3)
-        with cols[0]:
-            if st.button("▶ Ejecutar", key=f"exec_{r['OTID']}"):
-                st.session_state.ots.loc[st.session_state.ots["OTID"] == r["OTID"], "EstadoOT"] = "En ejecución"
-                save_all_ots()
-                st.rerun()
-        with cols[1]:
-            if st.button("✅ Cerrar", key=f"close_{r['OTID']}"):
-                st.session_state.ots.loc[st.session_state.ots["OTID"] == r["OTID"], "EstadoOT"] = "Cerrada"
-                save_all_ots()
-                st.rerun()
-        with cols[2]:
-            if st.button("🧾 Ver", key=f"seeav_{r['OTID']}"):
-                st.session_state.selected_aviso = r["AvisoID"]
-                st.session_state.page = "Detalle"
-                st.rerun()
-        st.divider()
+    abiertas = df[df["EstadoOT"] != "Cerrada"]
+    cerradas = df[df["EstadoOT"] == "Cerrada"]
+    tab1, tab2 = st.tabs([f"Abiertas ({len(abiertas)})", f"Cerradas ({len(cerradas)})"])
+    with tab1:
+        if abiertas.empty:
+            st.info("No hay OTs abiertas.")
+        for _, r in abiertas.iloc[::-1].iterrows():
+            tarjeta_ot(r.to_dict())
+    with tab2:
+        if cerradas.empty:
+            st.info("Aún no hay OTs cerradas.")
+        for _, r in cerradas.iloc[::-1].iterrows():
+            tarjeta_ot(r.to_dict())
 
 def page_planificacion():
     app_header("Planificación", back_page="Inicio")
