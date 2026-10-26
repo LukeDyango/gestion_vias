@@ -8,6 +8,9 @@ import json
 import base64
 import uuid
 import zipfile
+import re
+from xml.sax.saxutils import escape as xml_escape
+from html import escape as html_escape
 import time
 import hmac
 import hashlib
@@ -15,6 +18,15 @@ import traceback
 import numbers
 import calendar
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
+
+# Streamlit Cloud corre en UTC: ahora() allá da la hora de Londres, y después de las
+# ~20:00 en Chile los reportes quedaban con la fecha del día siguiente. Toda la app usa
+# ahora(): hora local de Chile, sin zona (naive) para que las restas y formatos sigan igual.
+TZ_CHILE = ZoneInfo("America/Santiago")
+
+def ahora() -> datetime:
+    return datetime.now(TZ_CHILE).replace(tzinfo=None)
 import openpyxl
 import openpyxl.styles
 from openpyxl.drawing.image import Image as XLImage
@@ -68,6 +80,8 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
     div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 100% !important; flex: 1 1 100% !important; }
     .st-key-bottom_nav div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 0 !important; flex: 1 1 0 !important; }
     .st-key-header_row div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 0 !important; }
+    [class*="st-key-accav_"] div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
+    [class*="st-key-accav_"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 0 !important; flex: 1 1 0 !important; }
     [class*="st-key-otbtns_"] div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
     [class*="st-key-otbtns_"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] { min-width: 0 !important; flex: 1 1 0 !important; }
     [class*="st-key-otbtns_"] button { padding: 0.5rem 0.2rem !important; font-size: 13px !important; }
@@ -97,6 +111,9 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
 .st-key-cd_pills_box button { min-width: 2.6rem; justify-content: center; font-weight: 700; }
 .st-key-btn_mis_reportes button { background: #3D7DD9 !important; color: #fff !important; border: none !important; text-align: left !important; }
 .st-key-btn_rechazar button { background: #DC3545 !important; color: #fff !important; border: none !important; }
+[class*="st-key-apr_"] button { background: #2FA84F !important; color: #fff !important; border: none !important; }
+[class*="st-key-rechazar_"] button { background: #DC3545 !important; color: #fff !important; border: none !important; }
+[class*="st-key-observar_"] button { background: #E0A458 !important; color: #fff !important; border: none !important; }
 .st-key-btn_observar button { background: #E0A458 !important; color: #fff !important; border: none !important; }
 .st-key-btn_cerrar button, .st-key-btn_cerrar_ot button { background: #6c757d !important; color: #fff !important; border: none !important; }
 
@@ -106,7 +123,13 @@ div.stButton > button, div.stFormSubmitButton > button, div.stDownloadButton > b
 /* ---- List rows ---- */
 .aviso-row { padding: 10px 0; border-bottom: 1px solid #eee; }
 .aviso-title { font-weight: 700; font-size: 15px; margin-bottom: 2px; }
-.aviso-desc { color: #444; font-size: 13.5px; }
+.aviso-desc { opacity: .8; font-size: 13.5px; }  /* opacity y no un gris fijo: legible en tema claro y oscuro */
+.chips-aprob { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.chip-aprob { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; }
+.chip-ok { background: #D4EDDA; color: #155724; }
+.chip-espera { background: #FFE8B3; color: #7A5200; }
+.chip-cola { background: #E2E3E5; color: #41464B; }
+.aprob-nota { font-size: 12px; opacity: .85; margin-top: 3px; }
 .aviso-meta { color: #888; font-size: 12px; margin-top: 4px; }
 
 /* ---- Login ---- */
@@ -336,37 +359,52 @@ def _valores_a_df(valores: list, columnas: list) -> pd.DataFrame:
             df[col] = df[col].map(_fecha_desde_serial)
     return df
 
-def _leer_hoja_sheets_o_none(nombre_hoja: str, columnas: list, estricto: bool = False, fresco: bool = False):
-    """Lee una hoja desde Google Sheets. Devuelve None si Sheets no está configurado.
-    Si está configurado pero la lectura falla: con estricto=True lanza la excepción (para
-    que el llamador conserve lo que ya tenía), si no devuelve None (respaldo local).
-    fresco=True salta la caché (p.ej. para calcular el próximo correlativo)."""
-    if _cliente_sheets() is None:
+def _leer_hoja_sheets_o_none(nombre_hoja: str, columnas: list, estricto: bool = True, fresco: bool = False):
+    """Lee una hoja desde Google Sheets. Devuelve None SOLO si Sheets no está configurado
+    (uso local). Si está configurado, la lectura es siempre estricta: si falla, lanza
+    excepción -- nunca se cae al SQLite/Excel local, que en la nube puede estar vacío y
+    terminaría reescribiendo las hojas reales con esa tabla vacía. (`estricto` se mantiene
+    por compatibilidad.) fresco=True salta la caché (p.ej. para el próximo correlativo)."""
+    if not _sheets_configurado():
         return None
+    lector = _valores_hoja_sheets_directo if fresco else _valores_hoja_sheets
     try:
-        lector = _valores_hoja_sheets_directo if fresco else _valores_hoja_sheets
         return _valores_a_df(lector(nombre_hoja), columnas)
-    except Exception:
-        if estricto:
-            raise
-        return None
+    except ErrorConexionSheets:
+        raise
+    except Exception as error:
+        raise ErrorConexionSheets(f"No se pudo leer la hoja {nombre_hoja} de Google Sheets: {error}") from error
 
-def load_avisos(estricto: bool = False):
+COLUMNAS_BOOL_AVISOS = ["OT_Creada", "AprobadoSacyr", "AprobadoADI", "AprobadoEFE", "AprobadoSubcontrato"]
+
+def normalizar_avisos(df: pd.DataFrame) -> pd.DataFrame:
+    """Tipos de la tabla de avisos, vengan de Sheets (texto) o de SQLite (0/1)."""
+    df = df.copy()
+    for col in AVISO_COLUMNS:  # avisos guardados antes de agregar columnas nuevas (p.ej. ObsCierre)
+        if col not in df.columns:
+            df[col] = ""
+    for col in COLUMNAS_BOOL_AVISOS:
+        df[col] = df[col].apply(_a_bool)
+    df["RolFinal"] = df["RolFinal"].fillna("EFE").replace("", "EFE")
+    return df
+
+def normalizar_ots(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in OTS_COLUMNS:  # OTs guardadas antes de agregar columnas nuevas (FechaCierre, CerradoPor)
+        if col not in df.columns:
+            df[col] = ""
+    return df
+
+def load_avisos(estricto: bool = True, fresco: bool = False):
     """Avisos: Google Sheets es la fuente de verdad cuando está configurado (así los avisos
-    creados en Streamlit Cloud sobreviven a que el hosting reinicie el disco local); si no
-    está configurado, o falla la conexión, se usa el SQLite local como respaldo."""
-    df = _leer_hoja_sheets_o_none("Avisos", AVISO_COLUMNS, estricto)
+    creados en Streamlit Cloud sobreviven a que el hosting reinicie el disco local). Si está
+    configurado y falla, lanza excepción (nunca cae al SQLite local). Sin Sheets: SQLite."""
+    df = _leer_hoja_sheets_o_none("Avisos", AVISO_COLUMNS, fresco=fresco)
     if df is None:
         conn = get_db()
         df = pd.read_sql("SELECT * FROM avisos", conn)
         conn.close()
-    for col in AVISO_COLUMNS:  # avisos guardados antes de agregar columnas nuevas (p.ej. ObsCierre)
-        if col not in df.columns:
-            df[col] = ""
-    for col in ["OT_Creada", "AprobadoSacyr", "AprobadoADI", "AprobadoEFE", "AprobadoSubcontrato"]:
-        df[col] = df[col].apply(_a_bool)
-    df["RolFinal"] = df["RolFinal"].fillna("EFE").replace("", "EFE")
-    return df
+    return normalizar_avisos(df)
 
 def load_activos():
     conn = get_db()
@@ -374,36 +412,95 @@ def load_activos():
     conn.close()
     return df
 
-def load_ots(estricto: bool = False):
+def load_ots(estricto: bool = True, fresco: bool = False):
     """OTs: mismo criterio que load_avisos() -- Sheets primero si está configurado, si no SQLite."""
-    df = _leer_hoja_sheets_o_none("OTs", OTS_COLUMNS, estricto)
+    df = _leer_hoja_sheets_o_none("OTs", OTS_COLUMNS, fresco=fresco)
     if df is None:
         conn = get_db()
         df = pd.read_sql("SELECT * FROM ots", conn)
         conn.close()
-    for col in OTS_COLUMNS:  # OTs guardadas antes de agregar columnas nuevas (FechaCierre, CerradoPor)
-        if col not in df.columns:
-            df[col] = ""
-    return df
+    return normalizar_ots(df)
+
+def _valor_comparable(v) -> str:
+    """Normaliza un valor a texto para comparar filas venidas de Sheets, SQLite o pandas."""
+    if v is None or isinstance(v, bool):
+        return "" if v is None else ("1" if v else "0")
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, numbers.Number) and float(v).is_integer():
+        return str(int(v))
+    return str(v).strip()
+
+def filas_cambiadas(actual: pd.DataFrame, base: pd.DataFrame, clave: str, columnas: list) -> pd.DataFrame:
+    """Filas de `actual` que son nuevas o distintas respecto de `base` (por la columna clave)."""
+    if actual.empty:
+        return actual
+    firma = lambda fila: tuple(_valor_comparable(fila.get(c)) for c in columnas)
+    base_por_clave = {} if base is None or base.empty else {
+        str(f[clave]): firma(f) for _, f in base.iterrows()}
+    cambiadas = [i for i, f in actual.iterrows() if base_por_clave.get(str(f[clave])) != firma(f)]
+    return actual.loc[cambiadas]
+
+def fusionar_cambios(fresca: pd.DataFrame, cambios: pd.DataFrame, clave: str, columnas: list) -> pd.DataFrame:
+    """Aplica solo las filas cambiadas por esta sesión sobre la tabla fresca de Sheets:
+    reemplaza las existentes (por clave) y agrega las nuevas al final."""
+    fresca = fresca.reindex(columns=columnas).reset_index(drop=True)
+    cambios = cambios.reindex(columns=columnas)
+    posiciones = {str(k): i for i, k in enumerate(fresca[clave])}
+    nuevas = []
+    for _, fila in cambios.iterrows():
+        i = posiciones.get(str(fila[clave]))
+        if i is None:
+            nuevas.append(fila)
+        else:
+            fresca.loc[i, columnas] = fila[columnas].values
+    if nuevas:
+        fresca = pd.concat([fresca, pd.DataFrame(nuevas, columns=columnas)], ignore_index=True)
+    return fresca
+
+def _guardar_tabla_compartida(clave_estado: str, nombre_hoja: str, clave: str, columnas: list,
+                              cargador, normalizar, preparar) -> None:
+    """Guarda Avisos u OTs sin pisar a otros usuarios. Antes se reescribía la hoja entera
+    desde la sesión de cada uno (con hasta 60 s de antigüedad por la caché): si Sacyr y ADI
+    aprobaban dos avisos distintos casi a la vez, una aprobación se perdía. Ahora:
+    1) se lee la hoja fresca (sin caché, estricta); 2) se calculan las filas que cambió ESTA
+    sesión respecto de la copia base cargada; 3) solo esas se aplican sobre la fresca;
+    4) se escribe el resultado y se actualizan la sesión y la base."""
+    actual = st.session_state[clave_estado]
+    base = st.session_state.get(f"_base_{clave_estado}")
+    try:
+        fresca = cargador(fresco=True)
+    except Exception as error:
+        raise ErrorGuardadoSheets(f"No se pudo leer {nombre_hoja} antes de guardar: {error}") from error
+    if base is None:  # sin copia base (no debería pasar): se compara contra lo fresco
+        base = fresca
+    cambios = filas_cambiadas(actual, base, clave, columnas)
+    resultado = normalizar(fusionar_cambios(fresca, cambios, clave, columnas))
+    df = preparar(resultado)
+    conn = get_db()
+    df.to_sql(nombre_hoja.lower(), conn, if_exists="replace", index=False)
+    conn.commit()
+    conn.close()
+    _sincronizar_tabla_sheets(nombre_hoja, df.values.tolist())  # lanza ErrorGuardadoSheets si falla
+    st.session_state[clave_estado] = resultado
+    st.session_state[f"_base_{clave_estado}"] = resultado.copy()
+
+def _preparar_avisos_escritura(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in COLUMNAS_BOOL_AVISOS:
+        df[col] = df[col].apply(_a_bool).astype(int)
+    return df.reindex(columns=AVISO_COLUMNS).fillna("")
 
 def save_all_avisos():
-    df = st.session_state.avisos.copy()
-    for col in ["OT_Creada", "AprobadoSacyr", "AprobadoADI", "AprobadoEFE", "AprobadoSubcontrato"]:
-        df[col] = df[col].apply(_a_bool).astype(int)
-    df = df.reindex(columns=AVISO_COLUMNS).fillna("")
-    conn = get_db()
-    df.to_sql("avisos", conn, if_exists="replace", index=False)
-    conn.commit()
-    conn.close()
-    _sincronizar_tabla_sheets("Avisos", df.values.tolist())
+    _guardar_tabla_compartida("avisos", "Avisos", "AvisoID", AVISO_COLUMNS, load_avisos, normalizar_avisos,
+                              _preparar_avisos_escritura)
 
 def save_all_ots():
-    df = st.session_state.ots.copy().reindex(columns=OTS_COLUMNS).fillna("")
-    conn = get_db()
-    df.to_sql("ots", conn, if_exists="replace", index=False)
-    conn.commit()
-    conn.close()
-    _sincronizar_tabla_sheets("OTs", df.values.tolist())
+    _guardar_tabla_compartida("ots", "OTs", "OTID", OTS_COLUMNS, load_ots, normalizar_ots,
+                              lambda df: df.reindex(columns=OTS_COLUMNS).fillna(""))
 
 # -------------------------
 # Control de Durmientes por Collera (catálogo geométrico + estado real)
@@ -760,21 +857,37 @@ GRUPOS_VIA = ["01", "02", "03", "04", "05"]
 # -------------------------
 GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+class ErrorConexionSheets(RuntimeError):
+    """Google Sheets está configurado pero no se pudo conectar o leer."""
+
+class ErrorGuardadoSheets(RuntimeError):
+    """Google Sheets está configurado y el cambio NO quedó guardado (hay que reintentar)."""
+
+def _sheets_configurado() -> bool:
+    """True si Secrets trae [google_sheets] con sheet_id y credenciales. Distingue el uso
+    local legítimo (sin Sheets: SQLite/Excel) de una falla de conexión (Sheets configurado
+    pero caído), que NUNCA debe hacer caer la app a datos locales: en la nube están vacíos y
+    al guardar se reescribirían las hojas con esa tabla vacía."""
+    try:
+        gs = st.secrets["google_sheets"]
+        return bool(gs["sheet_id"]) and bool(dict(gs["credentials"]))
+    except Exception:
+        return False
+
 @st.cache_resource(show_spinner=False)
 def _cliente_sheets():
-    """Conecta con el Google Sheet configurado en Secrets. Si no está configurado
-    o falla la conexión, devuelve None y la app sigue funcionando solo con el Excel local."""
-    try:
-        creds_info = dict(st.secrets["google_sheets"]["credentials"])
-        sheet_id = st.secrets["google_sheets"]["sheet_id"]
-    except Exception:
+    """Conecta con el Google Sheet configurado en Secrets. Devuelve None solo si Sheets NO
+    está configurado. Si está configurado y la conexión falla, lanza ErrorConexionSheets:
+    cache_resource no guarda excepciones, así que se reintenta en la próxima llamada (antes
+    se guardaba None y la app quedaba en modo local hasta reiniciar el servidor)."""
+    if not _sheets_configurado():
         return None
     try:
-        creds = GoogleCredentials.from_service_account_info(creds_info, scopes=GOOGLE_SHEETS_SCOPES)
-        gc = gspread.authorize(creds)
-        return gc.open_by_key(sheet_id)
-    except Exception:
-        return None
+        creds = GoogleCredentials.from_service_account_info(
+            dict(st.secrets["google_sheets"]["credentials"]), scopes=GOOGLE_SHEETS_SCOPES)
+        return gspread.authorize(creds).open_by_key(st.secrets["google_sheets"]["sheet_id"])
+    except Exception as error:
+        raise ErrorConexionSheets(f"No se pudo conectar con Google Sheets: {error}") from error
 
 def _asegurar_hoja(spreadsheet, nombre_hoja: str, headers: list | None = None):
     """Devuelve (worksheet, encabezados reales de la fila 1), creando la pestaña si no
@@ -848,6 +961,52 @@ def _celda_api(v) -> dict:
         return {}
     return {"userEnteredValue": {"stringValue": str(v)}}
 
+# -------------------------
+# Escritura segura de Excel (descargas que Excel abría pidiendo «reparar»)
+# -------------------------
+_CARACTERES_ILEGALES_XLSX = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+def _limpiar_valor(v):
+    """Valor apto para una celda de Excel: None/NaN → "", numpy → Python, fechas pandas →
+    texto, sin caracteres de control (no válidos en XML) y como máximo 32.000 caracteres."""
+    if v is None:
+        return ""
+    if hasattr(v, "item") and not isinstance(v, (str, bytes)):  # tipos numpy
+        try:
+            v = v.item()
+        except Exception:
+            pass
+    if isinstance(v, (pd.Timestamp, datetime, date)):
+        return str(v)
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, str):
+        return _CARACTERES_ILEGALES_XLSX.sub("", v)[:32000]
+    return v
+
+def _agregar_fila(ws, fila):
+    """ws.append seguro. openpyxl guarda como FÓRMULA todo texto que empieza con «=» (una
+    observación como «=1+», una ubicación «=km 3»...): si la fórmula es inválida, Excel
+    abre el archivo pidiendo «reparar». Acá esos textos se fuerzan a texto ("s")."""
+    valores = [_limpiar_valor(v) for v in fila]
+    ws.append(valores)
+    for celda, valor in zip(ws[ws.max_row], valores):
+        if isinstance(valor, str) and valor.startswith("="):
+            celda.value = valor
+            celda.data_type = "s"
+
+def _validar_xlsx(datos: bytes) -> bool:
+    """True si el archivo se puede volver a abrir (si no, está corrupto)."""
+    try:
+        openpyxl.load_workbook(io.BytesIO(datos))
+        return True
+    except Exception as error:
+        print(f"[ERROR Excel inválido] {type(error).__name__}: {error}", flush=True)
+        return False
+
 def _agregar_filas_excel_local(bloques: dict):
     init_reportes_excel()
     wb = openpyxl.load_workbook(REPORTES_XLSX_PATH)
@@ -855,7 +1014,7 @@ def _agregar_filas_excel_local(bloques: dict):
         ws_local = wb[nombre_hoja]
         header_real = [c.value for c in ws_local[1]]
         for fila in filas:
-            ws_local.append(_fila_por_encabezado(fila, REPORTES_SHEETS[nombre_hoja], header_real))
+            _agregar_fila(ws_local, _fila_por_encabezado(fila, REPORTES_SHEETS[nombre_hoja], header_real))
     wb.save(REPORTES_XLSX_PATH)
 
 def _reporte_ya_guardado(reporte_id: str) -> bool:
@@ -875,8 +1034,8 @@ def guardar_bloques(bloques: dict) -> bool:
     bloques = {h: f for h, f in bloques.items() if f}
     if not bloques:
         return True
-    sh = _cliente_sheets()
-    if sh is not None:
+    configurado = _sheets_configurado()
+    if configurado:
         reporte_id = bloques["Reportes"][0][0] if "Reportes" in bloques else None
         ok = False
         for intento in range(3):
@@ -884,6 +1043,7 @@ def guardar_bloques(bloques: dict) -> bool:
                 ok = True  # el intento anterior sí llegó a Google, solo falló la respuesta
                 break
             try:
+                sh = _cliente_sheets()  # dentro del try: si no conecta, cuenta como intento fallido
                 requests = []
                 if intento:  # si el primer intento falló, la estructura en caché pudo quedar vieja
                     _preparar_hojas_cache.clear()
@@ -907,13 +1067,15 @@ def guardar_bloques(bloques: dict) -> bool:
     try:
         _agregar_filas_excel_local(bloques)
     except Exception:
-        if sh is None:
+        if not configurado:
             return False  # sin Sheets, el Excel local es el único registro
     return True
 
 def _leer_hoja_df(nombre_hoja: str, fresco: bool = False) -> pd.DataFrame:
     """Lee una hoja completa como DataFrame: desde Google Sheets si está configurado
-    (fuente de verdad, sobrevive reinicios), si no desde el Excel local."""
+    (fuente de verdad, sobrevive reinicios), si no desde el Excel local. Con Sheets
+    configurado, si la lectura falla lanza ErrorConexionSheets: NO cae al Excel local (antes
+    Planificación podía reescribir PlanMensual entera con solo el mes visible)."""
     columnas = REPORTES_SHEETS.get(nombre_hoja, [])
     df = _leer_hoja_sheets_o_none(nombre_hoja, columnas, fresco=fresco)
     if df is not None:
@@ -955,9 +1117,11 @@ def _sincronizar_tabla_sheets(nombre_hoja: str, filas: list):
     PlanMensual- en vez de ir agregando filas como en Reportes/Trabajos.
     Primero escribe los datos nuevos encima y recién después limpia las filas sobrantes:
     antes se borraba la pestaña y se recreaba, y si la API fallaba entre medio la tabla
-    completa se perdía en Sheets."""
-    sh = _cliente_sheets()
-    if sh is None:
+    completa se perdía en Sheets.
+    Reintenta 3 veces. Si Sheets está configurado y no se pudo escribir, lanza
+    ErrorGuardadoSheets (antes el error se silenciaba: el usuario veía «creado ✅» pero el
+    dato nunca llegaba a Sheets y desaparecía en el siguiente refresco)."""
+    if not _sheets_configurado():
         return
     headers = REPORTES_SHEETS[nombre_hoja]
     # RAW (no USER_ENTERED): USER_ENTERED hace que el propio Sheet reinterprete los
@@ -965,19 +1129,26 @@ def _sincronizar_tabla_sheets(nombre_hoja: str, filas: list):
     # decimal, punto como separador de miles) "430.56" se leía como "43.056" y quedaba
     # guardado como 43056. RAW escribe el valor literal, sin reinterpretación.
     valores = [headers] + [[_celda_sheets(v) for v in fila] for fila in filas]
+    ultimo_error = None
     try:
-        ws = _hoja_sheets(sh, nombre_hoja)
-        filas_grilla = max(ws.row_count, len(valores))
-        cols_grilla = max(ws.col_count, len(headers))
-        if filas_grilla > ws.row_count or cols_grilla > ws.col_count:
-            ws.resize(rows=filas_grilla, cols=cols_grilla)
-        ws.update(values=valores, range_name="A1", value_input_option="RAW")
-        if filas_grilla > len(valores):
-            ws.batch_clear([f"A{len(valores) + 1}:{get_column_letter(cols_grilla)}{filas_grilla}"])
-    except Exception:
-        pass  # si falla Sheets, los datos igual quedaron guardados localmente
+        for intento in range(3):
+            try:
+                ws = _hoja_sheets(_cliente_sheets(), nombre_hoja)
+                filas_grilla = max(ws.row_count, len(valores))
+                cols_grilla = max(ws.col_count, len(headers))
+                if filas_grilla > ws.row_count or cols_grilla > ws.col_count:
+                    ws.resize(rows=filas_grilla, cols=cols_grilla)
+                ws.update(values=valores, range_name="A1", value_input_option="RAW")
+                if filas_grilla > len(valores):
+                    ws.batch_clear([f"A{len(valores) + 1}:{get_column_letter(cols_grilla)}{filas_grilla}"])
+                return
+            except Exception as error:
+                ultimo_error = error
+                time.sleep(1.5 * (intento + 1))
     finally:
         _invalidar_cache_sheets()
+    print(f"[ERROR guardado Sheets] hoja={nombre_hoja}: {ultimo_error}", flush=True)
+    raise ErrorGuardadoSheets(f"No se pudo guardar la hoja {nombre_hoja} en Google Sheets: {ultimo_error}")
 
 # -------------------------
 # Respaldo de fotos en Google Sheets
@@ -1008,11 +1179,10 @@ def _ubicar_foto(reporte_id, nombre, ruta_original="") -> str | None:
 def _respaldar_fotos_sheets(reporte_id: str, fotos: list) -> bool | None:
     """Sube a FotosData las fotos [(nombre, ruta)] de un reporte. Devuelve None si Sheets
     no está configurado, True si todas quedaron respaldadas y False si alguna falló."""
-    sh = _cliente_sheets()
-    if sh is None or not fotos:
+    if not _sheets_configurado() or not fotos:
         return None
     try:
-        ws = _hoja_sheets(sh, FOTOS_DATA_HOJA, FOTOS_DATA_COLUMNS)
+        ws = _hoja_sheets(_cliente_sheets(), FOTOS_DATA_HOJA, FOTOS_DATA_COLUMNS)
     except Exception:
         return False
     todo_ok = True
@@ -1051,13 +1221,13 @@ def _restaurar_fotos_desde_sheets(pares: list):
     """Reconstruye en el disco local las fotos [(ReporteID, NombreArchivo)] que falten,
     descargándolas de FotosData (varias por llamada a la API)."""
     faltantes = [(str(r), str(n)) for r, n in pares if not os.path.exists(_ruta_foto_local(r, n))]
-    sh = _cliente_sheets()
-    if not faltantes or sh is None:
+    if not faltantes or not _sheets_configurado():
         return
     try:
+        sh = _cliente_sheets()
         indice = _indice_fotos_sheets()
     except Exception:
-        return
+        return  # sin conexión: la foto se muestra como «no disponible», no rompe la pantalla
     faltantes = [p for p in dict.fromkeys(faltantes) if p in indice]
     for i in range(0, len(faltantes), 10):
         grupo = faltantes[i:i + 10]
@@ -1088,7 +1258,7 @@ def _restaurar_fotos_desde_sheets(pares: list):
 def subir_fotos_locales_faltantes() -> int:
     """Sube a FotosData las fotos que existen en el disco local pero todavía no están
     respaldadas (reportes guardados antes de este respaldo). Devuelve cuántas subió."""
-    if _cliente_sheets() is None:
+    if not _sheets_configurado():
         return 0
     df_fot = _leer_hoja_df("Fotos")
     if df_fot.empty:
@@ -1151,7 +1321,7 @@ def next_reporte_id():
     """Próximo correlativo RPT-xxxxx. Con Sheets configurado se lee sin caché y en modo
     estricto: si Google no responde, lanza excepción en vez de calcular el número con el
     Excel local (que en la nube puede estar vacío y repetiría RPT-00001, pisando reportes)."""
-    if _cliente_sheets() is not None:
+    if _sheets_configurado():
         df = _leer_hoja_sheets_o_none("Reportes", REPORTES_SHEETS["Reportes"], estricto=True, fresco=True)
     else:
         df = _leer_hoja_df("Reportes")
@@ -1166,12 +1336,16 @@ def next_reporte_id():
     return f"RPT-{n:05d}"
 
 def obtener_actividades_hoy(usuario: str) -> list:
-    """Actividades registradas en el/los Reporte(s) Diario(s) de hoy para este usuario."""
-    df_rep = _leer_hoja_df("Reportes")
-    df_trab = _leer_hoja_df("Trabajos")
+    """Actividades registradas en el/los Reporte(s) Diario(s) de hoy para este usuario.
+    Es solo una ayuda para el formulario de incidencias: si Sheets falla, devuelve []."""
+    try:
+        df_rep = _leer_hoja_df("Reportes")
+        df_trab = _leer_hoja_df("Trabajos")
+    except Exception:
+        return []
     if df_rep.empty or df_trab.empty:
         return []
-    hoy = datetime.now().strftime("%Y-%m-%d")
+    hoy = ahora().strftime("%Y-%m-%d")
     reportes_hoy = df_rep[(df_rep["Fecha"].astype(str) == hoy) & (df_rep["Usuario"] == usuario)]["ReporteID"].tolist()
     if not reportes_hoy:
         return []
@@ -1192,7 +1366,7 @@ def guardar_plan_mensual(filas: list):
     ws = wb.create_sheet("PlanMensual")
     ws.append(headers)
     for fila in filas:
-        ws.append(fila)
+        _agregar_fila(ws, fila)
     wb.save(REPORTES_XLSX_PATH)
 
     _sincronizar_tabla_sheets("PlanMensual", filas)
@@ -1351,8 +1525,10 @@ _ESTILO_CELDA_PDF = ParagraphStyle("celda_pdf", fontName="Helvetica", fontSize=8
 _ESTILO_CELDA_PDF_HEADER = ParagraphStyle("celda_pdf_header", fontName="Helvetica-Bold", fontSize=8, leading=10, textColor=colors.white)
 
 def _celda_pdf(valor, header=False) -> Paragraph:
-    texto = "—" if valor in (None, "") else str(valor)
-    return Paragraph(texto, _ESTILO_CELDA_PDF_HEADER if header else _ESTILO_CELDA_PDF)
+    texto = "—" if valor in (None, "") else str(_limpiar_valor(valor))
+    # escape: reportlab interpreta «<» y «&» como marcado; un texto del usuario como «km < 30»
+    # hacía fallar el PDF completo.
+    return Paragraph(xml_escape(texto), _ESTILO_CELDA_PDF_HEADER if header else _ESTILO_CELDA_PDF)
 
 def _tabla_pdf(headers, filas, col_widths):
     """Tabla con anchos de columna fijos y texto envuelto en Paragraph, para que nombres
@@ -1394,7 +1570,7 @@ def _pie_pagina_pdf(canvas, doc, reporte_id: str):
     canvas.saveState()
     canvas.setFont("Helvetica", 7)
     canvas.setFillColor(colors.HexColor("#8A8F98"))
-    canvas.drawString(1.5 * cm, 0.9 * cm, f"Reporte Diario {reporte_id} · Generado {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+    canvas.drawString(1.5 * cm, 0.9 * cm, f"Reporte Diario {reporte_id} · Generado {ahora().strftime('%d-%m-%Y %H:%M')}")
     canvas.drawRightString(A4[0] - 1.5 * cm, 0.9 * cm, f"Página {doc.page}")
     canvas.restoreState()
 
@@ -1412,28 +1588,45 @@ def generar_excel_reporte(resumen: dict) -> bytes:
 
     ws.append(FLAT_HEADERS)
     for t in resumen["trabajos"]:
-        ws.append([
+        _agregar_fila(ws, [
             resumen["grupo_via"], resumen["usuario"], resumen["fecha"], resumen.get("ubicacion") or "—",
             t["actividad"], t["collera_desde_id"], t["collera_hasta_id"], t["km_desde"], t["km_hasta"], t["unidad"], t["cantidad"], t["hh"],
             equipo_txt, material_txt, fotos_obs_txt, asistencia_txt,
         ])
     _ajustar_anchos_columnas(ws, FLAT_COL_WIDTHS)
 
+    imagenes_vivas = []  # los BytesIO deben seguir vivos hasta wb.save
     if resumen["fotos"]:
         fila = ws.max_row + 3
         ws.cell(row=fila - 1, column=1, value="FOTOGRAFÍAS")
         for nombre, ruta in resumen["fotos"]:
             try:
-                img = XLImage(ruta)
-                img.width, img.height = 260, 195
+                # No se pasa la ruta a XLImage: se re-codifica como JPEG estándar de ~800 px.
+                # Formatos raros de cámara (MPO, CMYK, EXIF girado) incrustados tal cual pueden
+                # dejar el .xlsx dañado.
+                with PILImage.open(ruta) as original:
+                    im = ImageOps.exif_transpose(original).convert("RGB")
+                im.thumbnail((800, 800))
+                buf_img = io.BytesIO()
+                im.save(buf_img, format="JPEG", quality=80)
+                buf_img.seek(0)
+                imagenes_vivas.append(buf_img)
+                img = XLImage(buf_img)
+                img.width, img.height = 260, int(260 * im.height / im.width)
                 ws.add_image(img, f"A{fila}")
-                fila += 13
+                fila += max(13, img.height // 15 + 1)
             except Exception:
                 ws.cell(row=fila, column=1, value=f"(No se pudo incrustar: {nombre})")
                 fila += 1
 
     if resumen.get("colleras"):
         hoja_excel_durmientes(wb, resumen["colleras"])
+    if resumen.get("aprobaciones"):
+        ws_ap = wb.create_sheet("Aprobaciones")
+        ws_ap.append(["Perfil", "Estado", "Fecha", "Responsable", "Observación"])
+        for a in resumen["aprobaciones"]:
+            _agregar_fila(ws_ap, [a["rol"], a["estado"], a["fecha"], a["responsable"], a["obs"]])
+        _ajustar_anchos_columnas(ws_ap, [14, 12, 18, 24, 50])
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1466,7 +1659,7 @@ def hoja_excel_durmientes(wb, colleras: list, con_reporte: bool = False, titulo:
         celda.alignment = openpyxl.styles.Alignment(wrap_text=True, horizontal="center", vertical="center")
     col_d1 = len(base) + 4
     for c in colleras:
-        ws.append(([c.get("reporte_id", ""), c.get("fecha", "")] if con_reporte else [])
+        _agregar_fila(ws, ([c.get("reporte_id", ""), c.get("fecha", "")] if con_reporte else [])
                   + [c["pk"], c["collera"], c["ubicacion"]] + [e or "" for e in c["secuencia"]]
                   + [c["efectivos"], c["n_malos"], c["efectivos"], c["min_efectivos"], c["racha_consec"], c["estado_general"]])
         fila = ws.max_row
@@ -1594,7 +1787,7 @@ def generar_pdf_ficha_durmientes(pk: int, fecha_str: str, colleras_pk: list, ins
         canvas.saveState()
         canvas.setFont("Helvetica", 6.5)
         canvas.setFillColor(colors.HexColor("#8A8F98"))
-        canvas.drawString(margen, 0.7 * cm, f"PK {pk} · {fecha_txt} · Registrado por {usuario} · Generado {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+        canvas.drawString(margen, 0.7 * cm, f"PK {pk} · {fecha_txt} · Registrado por {usuario} · Generado {ahora().strftime('%d-%m-%Y %H:%M')}")
         canvas.drawRightString(A4[0] - margen, 0.7 * cm, f"Página {d.page}")
         canvas.restoreState()
 
@@ -1645,11 +1838,11 @@ def generar_pdf_reporte(resumen: dict) -> bytes:
     estilo_valor = ParagraphStyle("valor_pdf", fontName="Helvetica", fontSize=9, textColor=colors.HexColor("#222222"))
     mitad = PDF_ANCHO_UTIL / 2 - 85
     info_data = [
-        [Paragraph("Grupo Vía", estilo_etiqueta), Paragraph(str(resumen["grupo_via"]), estilo_valor),
-         Paragraph("Fecha", estilo_etiqueta), Paragraph(str(resumen["fecha"]), estilo_valor)],
-        [Paragraph("Jefe de Grupo", estilo_etiqueta), Paragraph(str(resumen["usuario"]), estilo_valor),
+        [Paragraph("Grupo Vía", estilo_etiqueta), Paragraph(xml_escape(str(resumen["grupo_via"])), estilo_valor),
+         Paragraph("Fecha", estilo_etiqueta), Paragraph(xml_escape(str(resumen["fecha"])), estilo_valor)],
+        [Paragraph("Jefe de Grupo", estilo_etiqueta), Paragraph(xml_escape(str(resumen["usuario"])), estilo_valor),
          Paragraph("Jornada", estilo_etiqueta), Paragraph(f"{resumen['horas_dia']} h/trabajador", estilo_valor)],
-        [Paragraph("Ubicación", estilo_etiqueta), Paragraph(str(resumen.get("ubicacion") or "—"), estilo_valor), "", ""],
+        [Paragraph("Ubicación", estilo_etiqueta), Paragraph(xml_escape(str(resumen.get("ubicacion") or "—")), estilo_valor), "", ""],
     ]
     info_table = Table(info_data, colWidths=[85, mitad, 85, mitad])
     info_table.setStyle(TableStyle([
@@ -1701,13 +1894,22 @@ def generar_pdf_reporte(resumen: dict) -> bytes:
 
     el.append(_seccion_pdf("Observaciones"))
     el.append(Spacer(1, 6))
-    el.append(Paragraph(resumen["observaciones"] or "Sin observaciones.", styles["Normal"]))
+    el.append(Paragraph(xml_escape(str(resumen["observaciones"] or "Sin observaciones.")), styles["Normal"]))
     el.append(Spacer(1, 12))
 
     el.append(_seccion_pdf("Asistencia"))
     el.append(Spacer(1, 4))
     filas_asi = [[a["nombre"], a["cargo"], a["estado"]] for a in resumen["asistencia"]]
     el.append(_tabla_pdf(["Trabajador", "Cargo", "Estado"], filas_asi, [PDF_ANCHO_UTIL - 220, 130, 90]))
+
+    # Aprobaciones de SACYR y ADI (ITO) del aviso del reporte (para el Estado de Pago).
+    aprobaciones = resumen.get("aprobaciones") or aprobaciones_de_reporte(resumen["reporte_id"])
+    el.append(Spacer(1, 12))
+    el.append(_seccion_pdf("Aprobaciones"))
+    el.append(Spacer(1, 4))
+    el.append(_tabla_pdf(["Perfil", "Estado", "Fecha", "Responsable", "Observación"],
+                         [[a["rol"], a["estado"], a["fecha"], a["responsable"], a["obs"]] for a in aprobaciones],
+                         [70, 60, 80, 110, PDF_ANCHO_UTIL - 320]))
 
     if resumen["fotos"]:
         el.append(Spacer(1, 12))
@@ -1722,38 +1924,125 @@ def generar_pdf_reporte(resumen: dict) -> bytes:
                 el.append(RLImage(ruta, width=ancho, height=alto))
                 el.append(Spacer(1, 8))
             except Exception:
-                el.append(Paragraph(f"(No se pudo incrustar: {nombre})", styles["Normal"]))
+                el.append(Paragraph(xml_escape(f"(No se pudo incrustar: {nombre})"), styles["Normal"]))
 
     pie_pagina = lambda c, d: _pie_pagina_pdf(c, d, resumen["reporte_id"])
     doc.build(el, onFirstPage=pie_pagina, onLaterPages=pie_pagina)
     return buf.getvalue()
 
+def _excel_validado(generador, resumen: dict) -> bytes:
+    """Genera el Excel y comprueba que se pueda volver a abrir. Si falla o sale inválido,
+    reintenta sin fotos, y si vuelve a fallar, sin la hoja de durmientes."""
+    for intento, variante in enumerate((resumen, {**resumen, "fotos": []}, {**resumen, "fotos": [], "colleras": []})):
+        try:
+            datos = generador(variante)
+            if _validar_xlsx(datos):
+                if intento:
+                    print(f"[AVISO Excel] {resumen.get('reporte_id')}: generado en la variante {intento} (sin fotos/durmientes)", flush=True)
+                return datos
+        except Exception as error:
+            print(f"[ERROR Excel] {resumen.get('reporte_id')} variante {intento}: {type(error).__name__}: {error}", flush=True)
+    raise RuntimeError("No se pudo generar un Excel válido para el reporte.")
+
 def generar_documentos_reporte(resumen: dict):
     """Genera el Excel y PDF individuales. Si una foto hace fallar la incrustación
     (formatos raros de cámara que a veces se cuelan), reintenta sin fotos para que
     el reporte —ya guardado en el libro maestro— nunca se pierda por esto."""
-    try:
-        excel_bytes = generar_excel_reporte(resumen)
-    except Exception:
-        excel_bytes = generar_excel_reporte({**resumen, "fotos": []})
+    excel_bytes = _excel_validado(generar_excel_reporte, resumen)
     try:
         pdf_bytes = generar_pdf_reporte(resumen)
     except Exception:
         pdf_bytes = generar_pdf_reporte({**resumen, "fotos": []})
     return excel_bytes, pdf_bytes
 
-def _filas_respaldo_plano() -> list:
-    """Arma las filas planas del histórico completo (una fila por actividad, con Equipo/
-    Materiales/Fotos-Observación/Asistencia condensados cada uno en una sola celda) --
-    compartido entre el Excel y el PDF de respaldo, para no duplicar la lógica."""
-    df_rep = _leer_hoja_df("Reportes")
+# -------------------------
+# Reportes por mes y aprobaciones (Estado de Pago)
+# El mes de un reporte se deriva de su Fecha (str(Fecha)[:7]): sirve igual para los reportes
+# ya guardados, sin agregar columnas ni migrar datos.
+# -------------------------
+def _mes_de(fecha) -> str:
+    """'AAAA-MM' de una fecha guardada (texto 'AAAA-MM-DD…' o número de serie antiguo)."""
+    return str(_fecha_desde_serial(fecha) or "")[:7]
+
+def _clave_mes(anio, mes) -> str | None:
+    return f"{int(anio):04d}-{int(mes):02d}" if anio and mes else None
+
+def nombre_mes(clave_mes: str) -> str:
+    try:
+        return f"{MESES_ES[int(clave_mes[5:7]) - 1]} {clave_mes[:4]}"
+    except (ValueError, IndexError):
+        return "Sin fecha"
+
+def reportes_del_mes(anio=None, mes=None) -> pd.DataFrame:
+    """Reportes cuya Fecha cae en el mes dado (o todos si no se indica mes)."""
+    df = _leer_hoja_df("Reportes")
+    clave = _clave_mes(anio, mes)
+    if df.empty or not clave:
+        return df
+    return df[df["Fecha"].map(_mes_de) == clave]
+
+def meses_con_reportes() -> list:
+    """['AAAA-MM', …] con reportes, del más reciente al más antiguo."""
+    df = _leer_hoja_df("Reportes")
+    if df.empty:
+        return []
+    return sorted({m for m in df["Fecha"].map(_mes_de) if len(m) == 7}, reverse=True)
+
+def aprobaciones_de_reporte(reporte_id: str, avisos: pd.DataFrame | None = None) -> list:
+    """Estado de las aprobaciones de SACYR y ADI (ITO) del aviso ligado a un Reporte Diario:
+    [{rol, estado, fecha, responsable, obs}]. Estados: Aprobado (flag Aprobado* activo),
+    Rechazado (aviso Rechazado en ese nivel), Observado (aviso Observado y ese rol dejó
+    observación) o Pendiente. Sin aviso: ambos Pendiente."""
+    avisos = st.session_state.get("avisos") if avisos is None else avisos
+    fila = None
+    if avisos is not None and not avisos.empty and "ReporteID" in avisos.columns:
+        coincide = avisos[avisos["ReporteID"].astype(str) == str(reporte_id)]
+        if not coincide.empty:
+            fila = coincide.iloc[-1]
+    resultado = []
+    for rol, sufijo in (("SACYR", "Sacyr"), ("ADI (ITO)", "ADI")):
+        perfil = "Sacyr" if sufijo == "Sacyr" else "ADI (ITO)"
+        dato = {"rol": rol, "estado": "Pendiente", "fecha": "", "responsable": "", "obs": ""}
+        if fila is not None:
+            obs = str(_limpiar_valor(fila.get(f"Obs{sufijo}")) or "").strip()
+            if _a_bool(fila.get(f"Aprobado{sufijo}")):
+                dato.update(estado="Aprobado", fecha=str(_limpiar_valor(fila.get(f"FechaVal{sufijo}")) or ""),
+                            responsable=str(_limpiar_valor(fila.get(f"RespVal{sufijo}")) or ""), obs=obs)
+            elif fila.get("Estado") == "Rechazado" and fila.get("ValidacionNivel") == perfil:
+                dato.update(estado="Rechazado", obs=obs)
+            elif fila.get("Estado") == "Observado" and obs:
+                dato.update(estado="Observado", obs=obs)
+        resultado.append(dato)
+    return resultado
+
+def _texto_aprobacion(a: dict) -> str:
+    partes = [a["estado"]]
+    if a["fecha"]:
+        partes.append(a["fecha"])
+    if a["responsable"]:
+        partes.append(a["responsable"])
+    return " · ".join(partes)
+
+def _filas_aprobaciones_periodo(df_rep: pd.DataFrame) -> list:
+    """[Reporte, Fecha, Grupo Vía, Sacyr, ADI] para la hoja/tabla de aprobaciones."""
+    filas = []
+    for _, rep in df_rep.iterrows():
+        sacyr, adi = aprobaciones_de_reporte(str(rep["ReporteID"]))
+        filas.append([rep["ReporteID"], str(rep["Fecha"])[:10], rep["GrupoVia"], _texto_aprobacion(sacyr), _texto_aprobacion(adi)])
+    return filas
+
+def _filas_respaldo_plano(anio=None, mes=None) -> list:
+    """Arma las filas planas del histórico (una fila por actividad, con Equipo/Materiales/
+    Fotos-Observación/Asistencia condensados cada uno en una sola celda), opcionalmente solo
+    de un mes según la Fecha del reporte -- compartido entre el Excel y el PDF de respaldo."""
+    df_rep = reportes_del_mes(anio, mes)
+    if df_rep.empty:
+        return []
     df_trab = _leer_hoja_df("Trabajos")
     df_equ = _leer_hoja_df("Equipos")
     df_mat = _leer_hoja_df("Materiales")
     df_asi = _leer_hoja_df("Asistencia")
     df_fot = _leer_hoja_df("Fotos")
-    if df_rep.empty:
-        return []
 
     filas = []
     for _, rep in df_rep.iterrows():
@@ -1792,51 +2081,88 @@ def _filas_respaldo_plano() -> list:
             ])
     return filas
 
-def generar_respaldo_plano() -> bytes | None:
-    """Resumen legible de TODO el histórico en Excel. El libro maestro (reportes_diarios.xlsx)
-    sigue normalizado en hojas separadas para Power BI; esto es solo una vista aparte para leer rápido."""
-    filas = _filas_respaldo_plano()
+def nombre_archivo_respaldo(extension: str, anio=None, mes=None, prefijo: str = "reportes") -> str:
+    clave = _clave_mes(anio, mes)
+    return f"{prefijo}_{clave}.{extension}" if clave else f"{prefijo}_diarios_respaldo.{extension}"
+
+def _hoja_encabezada(wb, titulo: str, columnas: list, filas: list, anchos: list):
+    ws = wb.create_sheet(titulo)
+    ws.append(columnas)
+    for fila in filas:
+        _agregar_fila(ws, fila)
+    for celda in ws[1]:
+        celda.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
+        celda.fill = openpyxl.styles.PatternFill("solid", fgColor="0B3B8A")
+    _ajustar_anchos_columnas(ws, anchos)
+
+def _construir_respaldo_excel(anio=None, mes=None, con_extras: bool = True) -> bytes | None:
+    filas = _filas_respaldo_plano(anio, mes)
     if not filas:
         return None
+    clave = _clave_mes(anio, mes)
 
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Resumen"
     ws.append(FLAT_HEADERS)
     for fila in filas:
-        ws.append(fila)
+        _agregar_fila(ws, fila)
     _ajustar_anchos_columnas(ws, FLAT_COL_WIDTHS)
 
-    # Todas las inspecciones de colleras hechas en Reportes Diarios, en el formato del Excel de control.
-    df_insp = _leer_hoja_df("InspeccionColleras")
-    if not df_insp.empty:
-        hoja_excel_durmientes(wb, colleras_desde_inspecciones(df_insp), con_reporte=True)
+    # Aprobaciones de SACYR y ADI de cada reporte del período (para el Estado de Pago).
+    _hoja_encabezada(wb, "Aprobaciones", ["Reporte", "Fecha", "Grupo Vía", "SACYR", "ADI (ITO)"],
+                     _filas_aprobaciones_periodo(reportes_del_mes(anio, mes)), [12, 12, 10, 45, 45])
 
-    # OTs y su bitácora (qué pasó, qué se hizo, qué queda pendiente en cada paso).
-    for titulo, df_hoja, columnas, anchos in (
-        ("OTs", st.session_state.get("ots", pd.DataFrame()), OTS_COLUMNS, [11, 11, 30, 18, 16, 13, 16, 18]),
-        ("Bitácora OTs", _leer_hoja_df("OTHistorial"), OT_HISTORIAL_COLUMNS, [11, 11, 16, 18, 14, 18, 13, 40, 40, 40, 30]),
-    ):
-        if df_hoja is not None and not df_hoja.empty:
-            ws_h = wb.create_sheet(titulo)
-            ws_h.append(columnas)
-            for fila in df_hoja.reindex(columns=columnas).fillna("").values.tolist():
-                ws_h.append(fila)
-            for celda in ws_h[1]:
-                celda.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
-                celda.fill = openpyxl.styles.PatternFill("solid", fgColor="0B3B8A")
-            _ajustar_anchos_columnas(ws_h, anchos)
+    if con_extras:
+        # Inspecciones de colleras, en el formato del Excel de control (filtradas por mes si corresponde).
+        df_insp = _leer_hoja_df("InspeccionColleras")
+        if not df_insp.empty and clave:
+            df_insp = df_insp[df_insp["Fecha"].map(_mes_de) == clave]
+        if not df_insp.empty:
+            hoja_excel_durmientes(wb, colleras_desde_inspecciones(df_insp), con_reporte=True)
+
+        # OTs y su bitácora (qué pasó, qué se hizo, qué queda pendiente en cada paso).
+        df_ots = st.session_state.get("ots", pd.DataFrame())
+        df_bit = _leer_hoja_df("OTHistorial")
+        if clave:
+            if not df_ots.empty:
+                df_ots = df_ots[df_ots["FechaProgramada"].map(_mes_de) == clave]
+            if not df_bit.empty:
+                df_bit = df_bit[df_bit["FechaHora"].map(_mes_de) == clave]
+        for titulo, df_hoja, columnas, anchos in (
+            ("OTs", df_ots, OTS_COLUMNS, [11, 11, 30, 18, 16, 13, 16, 18]),
+            ("Bitácora OTs", df_bit, OT_HISTORIAL_COLUMNS, [11, 11, 16, 18, 14, 18, 13, 40, 40, 40, 30]),
+        ):
+            if df_hoja is not None and not df_hoja.empty:
+                _hoja_encabezada(wb, titulo, columnas, df_hoja.reindex(columns=columnas).fillna("").values.tolist(), anchos)
 
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
-def generar_respaldo_pdf() -> bytes | None:
+def generar_respaldo_plano(anio=None, mes=None) -> bytes | None:
+    """Resumen legible del histórico en Excel (todo, o solo un mes según la Fecha del
+    reporte). El libro maestro sigue normalizado en hojas separadas para Power BI; esto es una
+    vista aparte para leer rápido. Se valida antes de entregarlo: si sale inválido, se
+    regenera sin las hojas de durmientes y OTs."""
+    for con_extras in (True, False):
+        try:
+            datos = _construir_respaldo_excel(anio, mes, con_extras)
+        except Exception as error:
+            print(f"[ERROR Excel histórico] extras={con_extras}: {type(error).__name__}: {error}", flush=True)
+            continue
+        if datos is None or _validar_xlsx(datos):
+            return datos
+    raise RuntimeError("No se pudo generar un Excel válido del histórico.")
+
+def generar_respaldo_pdf(anio=None, mes=None) -> bytes | None:
     """Misma información que generar_respaldo_plano() pero en PDF (apaisado, para que
-    quepan las 16 columnas) -- entrega solicitada además del Excel."""
-    filas = _filas_respaldo_plano()
+    quepan las 16 columnas), más la tabla de aprobaciones de SACYR y ADI al final."""
+    filas = _filas_respaldo_plano(anio, mes)
     if not filas:
         return None
+    clave = _clave_mes(anio, mes)
+    titulo = f"REPORTES DIARIOS — {nombre_mes(clave).upper()}" if clave else "RESPALDO HISTÓRICO — REPORTES DIARIOS"
 
     ancho_pagina = landscape(A4)
     ancho_util = ancho_pagina[0] - 2.4 * cm
@@ -1847,7 +2173,7 @@ def generar_respaldo_pdf() -> bytes | None:
                              leftMargin=1.2 * cm, rightMargin=1.2 * cm)
 
     estilo_banner = ParagraphStyle("banner_resp", fontName="Helvetica-Bold", fontSize=13, textColor=colors.white)
-    banner = Table([[Paragraph("RESPALDO HISTÓRICO — REPORTES DIARIOS", estilo_banner)]], colWidths=[ancho_util])
+    banner = Table([[Paragraph(titulo, estilo_banner)]], colWidths=[ancho_util])
     banner.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#0B3B8A")),
         ("TOPPADDING", (0, 0), (-1, -1), 8),
@@ -1858,28 +2184,36 @@ def generar_respaldo_pdf() -> bytes | None:
     el = [
         banner,
         Spacer(1, 8),
-        Paragraph(f"{len(filas)} actividades registradas · Generado {datetime.now().strftime('%d-%m-%Y %H:%M')}", estilo_sub),
+        Paragraph(f"{len(filas)} actividades registradas · Generado {ahora().strftime('%d-%m-%Y %H:%M')}", estilo_sub),
         Spacer(1, 10),
         _tabla_pdf(FLAT_HEADERS, filas, anchos),
+        Spacer(1, 14),
+        Paragraph("<b>Aprobaciones SACYR y ADI (ITO)</b>", ParagraphStyle("t_ap", fontName="Helvetica-Bold", fontSize=10)),
+        Spacer(1, 4),
+        _tabla_pdf(["Reporte", "Fecha", "Grupo Vía", "SACYR", "ADI (ITO)"],
+                   _filas_aprobaciones_periodo(reportes_del_mes(anio, mes)), [70, 70, 60, 252, 252]),
     ]
 
     def _pie(c, d):
         c.saveState()
         c.setFont("Helvetica", 7)
         c.setFillColor(colors.HexColor("#8A8F98"))
-        c.drawString(1.2 * cm, 0.9 * cm, f"Respaldo histórico · Generado {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+        c.drawString(1.2 * cm, 0.9 * cm, f"{nombre_mes(clave) if clave else 'Respaldo histórico'} · Generado {ahora().strftime('%d-%m-%Y %H:%M')}")
         c.drawRightString(ancho_pagina[0] - 1.2 * cm, 0.9 * cm, f"Página {d.page}")
         c.restoreState()
 
     doc.build(el, onFirstPage=_pie, onLaterPages=_pie)
     return buf.getvalue()
 
-def generar_respaldo_fotos_zip() -> bytes | None:
-    """ZIP con todas las fotos del histórico, una carpeta por ReporteID. Las fotos que ya
-    no están en el disco local (reinicio de Streamlit Cloud) se recuperan desde Sheets."""
+def generar_respaldo_fotos_zip(anio=None, mes=None) -> bytes | None:
+    """ZIP con las fotos del histórico (todo o un mes), una carpeta por ReporteID. Las fotos
+    que ya no están en el disco local (reinicio de Streamlit Cloud) se recuperan desde Sheets."""
     df_fot = _leer_hoja_df("Fotos")
     if df_fot.empty:
         return None
+    if _clave_mes(anio, mes):
+        ids_mes = set(reportes_del_mes(anio, mes)["ReporteID"].astype(str))
+        df_fot = df_fot[df_fot["ReporteID"].astype(str).isin(ids_mes)]
     registros = [(str(f["ReporteID"]), str(f["NombreArchivo"]), f.get("RutaArchivo")) for _, f in df_fot.iterrows()]
     _restaurar_fotos_desde_sheets([(rid, nombre) for rid, nombre, _ in registros])
     buf = io.BytesIO()
@@ -1945,6 +2279,7 @@ def resumen_desde_historico(reporte_id: str) -> dict | None:
         "ubicacion": _txt(rep.get("Ubicacion")), "observaciones": _txt(rep.get("Observaciones")),
         "trabajos": trabajos, "equipos": equipos, "materiales": materiales,
         "asistencia": asistencia, "fotos": fotos,
+        "aprobaciones": aprobaciones_de_reporte(str(reporte_id)),
         "colleras": colleras_desde_inspecciones(inspecciones_filtradas(fecha, str(_txt(rep["Usuario"])), str(reporte_id))),
         "total_hh": sum(t["hh"] for t in trabajos),
     }
@@ -2074,18 +2409,21 @@ def init_data():
         st.session_state.activos = load_activos()
     # Avisos, OTs y durmientes se refrescan en cada recarga (desde la caché de Sheets, 60 s),
     # para que se vea lo que guardaron otros usuarios sin tener que volver a iniciar sesión.
-    # estricto=True: si Sheets falla en un refresco, se conserva lo que ya había en la sesión
-    # en vez de caer al SQLite local, que en la nube puede estar vacío o desactualizado.
+    # Si Sheets falla en un REFRESCO, se conserva lo que ya había en la sesión. Si falla la
+    # PRIMERA carga, se lanza la excepción (la app muestra un error con «Reintentar»): nunca
+    # se sigue con tablas vacías, porque al guardar reescribirían las hojas reales.
+    # Cada carga deja una copia base (_base_*) para guardar solo lo que cambió esta sesión.
     for clave, cargador in (("avisos", load_avisos), ("ots", load_ots), ("durmientes_estado", load_durmientes_estado)):
         if clave in st.session_state:
             try:
-                st.session_state[clave] = cargador(estricto=True)
+                st.session_state[clave] = cargador()
             except Exception:
-                pass
-    if "avisos" not in st.session_state:
-        st.session_state.avisos = load_avisos()
-    if "ots" not in st.session_state:
-        st.session_state.ots = load_ots()
+                continue
+        elif clave != "durmientes_estado":
+            st.session_state[clave] = cargador()
+        else:
+            continue
+        st.session_state[f"_base_{clave}"] = st.session_state[clave].copy()
     if "durmientes_estado" not in st.session_state:
         df_estado = load_durmientes_estado()
         if df_estado.empty:
@@ -2126,7 +2464,20 @@ def init_data():
     if "last_reporte_pdf" not in st.session_state:
         st.session_state.last_reporte_pdf = None
 
-init_data()
+try:
+    init_data()
+except Exception as _error_carga:
+    # Primera carga fallida (p.ej. Google Sheets caído o credenciales mal puestas): NO se
+    # sigue con tablas vacías (crear un aviso o guardar el plan reescribiría las hojas reales).
+    print(f"[ERROR carga inicial] {_error_carga}", flush=True)
+    st.error("⚠️ No se pudo cargar la información desde Google Sheets. La app no continúa para no "
+             "arriesgar los datos guardados. Revisa la conexión e intenta de nuevo; si se repite, "
+             "avisa al administrador.")
+    with st.expander("Detalle técnico (para el administrador)"):
+        st.code(f"{type(_error_carga).__name__}: {_error_carga}", language=None)
+    if st.button("🔄 Reintentar", key="btn_reintentar_carga"):
+        st.rerun()
+    st.stop()
 
 def next_aviso_id():
     df = st.session_state.avisos
@@ -2151,7 +2502,7 @@ def next_ot_id():
     return f"OT-{n:05d}"
 
 def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
+    return ahora().strftime("%Y-%m-%d %H:%M")
 
 def new_row_id():
     return uuid.uuid4().hex[:8]
@@ -2193,9 +2544,11 @@ def elapsed_str(fecha_hora_str: str) -> str:
         dt = datetime.strptime(fecha_hora_str, "%Y-%m-%d %H:%M")
     except Exception:
         return ""
-    delta = datetime.now() - dt
+    delta = ahora() - dt
     total_min = max(int(delta.total_seconds() // 60), 0)
     h, m = divmod(total_min, 60)
+    if h >= 48:  # antes mostraba «994hr35»
+        return f"{h // 24} d"
     return f"{h}hr{m}" if h > 0 else f"{m}min"
 
 # -------------------------
@@ -2574,13 +2927,16 @@ def page_crear_aviso(title="Crear Aviso"):
     descripcion = st.text_area("Descripción", height=100, placeholder="Describe el hallazgo o avería...", key=f"aviso_desc_{counter}")
     adjunto = st.file_uploader("Adjuntar foto o PDF (opcional)", type=["png", "jpg", "jpeg", "pdf"], key=f"aviso_adj_{counter}")
 
+    if adjunto is not None and adjunto.name.lower().endswith(".pdf") and adjunto.size > ADJUNTO_PDF_MAX_BYTES:
+        st.warning(f"El PDF pesa {adjunto.size / 1e6:.1f} MB: el máximo es 2 MB. Adjunta uno más liviano o una foto.")
     if st.button("Guardar", key="btn_guardar_aviso"):
         aviso_id = next_aviso_id()
+        nombre_adjunto = guardar_adjunto_aviso(aviso_id, adjunto)
         new_row = {
             "AvisoID": aviso_id, "Activo": activo, "Ubicacion": ubicacion or "—",
             "Prioridad": prioridad, "Tipificacion": tipificacion,
             "FechaHora": now_str(), "Descripcion": descripcion or "—",
-            "Adjunto": adjunto.name if adjunto else "",
+            "Adjunto": nombre_adjunto,
             "CreadoPor": st.session_state.usuario, "RolCreador": st.session_state.perfil,
             "Estado": "Nuevo", "OT_Creada": False,
             "ValidacionNivel": "Sacyr", "RolFinal": "EFE", "ReporteID": "",
@@ -2600,12 +2956,144 @@ def page_crear_aviso(title="Crear Aviso"):
             st.session_state.page = "Detalle"
         st.rerun()
 
+# -------------------------
+# Aprobaciones por aviso, avisos por aprobar y agrupación por mes
+# -------------------------
+_SERIAL_EN_TEXTO = re.compile(r"\((\d{5})\)")
+
+def texto_con_fechas(texto) -> str:
+    """Los avisos recuperados del histórico traen en el texto la fecha como número de serie
+    de Excel, p.ej. «(46235)»: se muestra como fecha real («(2026-08-01)»)."""
+    return _SERIAL_EN_TEXTO.sub(lambda m: f"({_fecha_desde_serial(int(m.group(1)))})", str(texto or ""))
+
+def estado_aprobaciones(row) -> dict:
+    """Quién aprobó y quién falta en un aviso. Devuelve {"niveles": [{rol, estado, fecha,
+    responsable}], "falta": [roles], "especial": texto|None}. Estado de cada nivel: «Aprobó»
+    (con fecha y responsable), «Esperando» (es el nivel actual) o «En cola»."""
+    rol_final = row.get("RolFinal") or "EFE"
+    col_aprob, _, col_fecha, col_resp = final_cols(rol_final)
+    niveles = []
+    for rol, aprob, fecha, resp in (("Sacyr", "AprobadoSacyr", "FechaValSacyr", "RespValSacyr"),
+                                    ("ADI (ITO)", "AprobadoADI", "FechaValADI", "RespValADI"),
+                                    (rol_final, col_aprob, col_fecha, col_resp)):
+        if _a_bool(row.get(aprob)):
+            estado = "Aprobó"
+        elif row.get("ValidacionNivel") == rol and row.get("Estado") not in ("Rechazado", "Cerrado", "Validado", "OT creada"):
+            estado = "Esperando"
+        else:
+            estado = "En cola"
+        niveles.append({"rol": rol, "estado": estado,
+                        "fecha": str(_limpiar_valor(row.get(fecha)) or "") if estado == "Aprobó" else "",
+                        "responsable": str(_limpiar_valor(row.get(resp)) or "") if estado == "Aprobó" else ""})
+    estado_aviso = row.get("Estado")
+    if estado_aviso == "Rechazado":
+        especial = "⛔ Rechazado"
+    elif estado_aviso == "Observado":
+        especial = "🟨 Observado, vuelve a Sacyr"
+    elif estado_aviso in ("Validado", "OT creada") or all(n["estado"] == "Aprobó" for n in niveles):
+        especial = "✅ Completo"
+    else:
+        especial = None
+    falta = [n["rol"] for n in niveles if n["estado"] != "Aprobó"]
+    return {"niveles": niveles, "falta": falta, "especial": especial}
+
+def avisos_visibles(perfil: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Avisos que se muestran a cada perfil. EFE no valida Reportes Diarios (esos los cierra
+    el Supervisor Subcontrato: Sacyr → ADI → Subcontrato), solo incidencias: no ve los
+    avisos de reportes en su Backlog ni en sus contadores."""
+    if df is None or df.empty or perfil != "EFE":
+        return df
+    return df[df["ReporteID"].fillna("").astype(str).str.strip() == ""]
+
+def avisos_por_aprobar(perfil: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Avisos que este perfil puede validar ahora (es su nivel y el aviso está abierto)."""
+    if df is None or df.empty:
+        return df
+    return df[[can_validate(perfil, fila) for fila in df.to_dict("records")]]
+
+def mes_de_aviso(row, fechas_reporte: dict) -> str:
+    """'AAAA-MM' del aviso: la Fecha del Reporte Diario si tiene ReporteID (los avisos
+    recuperados tienen todos FechaHora del día en que se recrearon y si no se mezclarían en
+    un solo mes), si no su FechaHora."""
+    rid = str(row.get("ReporteID") or "")
+    if rid and rid in fechas_reporte:
+        return _mes_de(fechas_reporte[rid])
+    return _mes_de(row.get("FechaHora"))
+
+def fechas_de_reportes() -> dict:
+    """{ReporteID: Fecha}, una sola lectura por pantalla."""
+    try:
+        df = _leer_hoja_df("Reportes")
+    except Exception:
+        return {}
+    return {} if df.empty else dict(zip(df["ReporteID"].astype(str), df["Fecha"]))
+
+def _html_aprobaciones(row) -> str:
+    info = estado_aprobaciones(row)
+    clase = {"Aprobó": "chip-ok", "Esperando": "chip-espera", "En cola": "chip-cola"}
+    chips = []
+    for n in info["niveles"]:
+        detalle = f" · {n['fecha']} · {n['responsable']}" if n["estado"] == "Aprobó" and (n["fecha"] or n["responsable"]) else ""
+        icono = {"Aprobó": "✓", "Esperando": "⏳", "En cola": "·"}[n["estado"]]
+        chips.append(f"<span class='chip-aprob {clase[n['estado']]}'>{icono} {html_escape(n['rol'])}"
+                     f"{html_escape(detalle)}</span>")
+    if info["especial"]:
+        nota = info["especial"]
+    else:
+        nota = "Falta: " + ", ".join(info["falta"]) if info["falta"] else ""
+    return (f"<div class='chips-aprob'>{''.join(chips)}</div>"
+            + (f"<div class='aprob-nota'>{html_escape(nota)}</div>" if nota else ""))
+
+# -------------------------
+# Adjunto de los avisos (antes solo se guardaba el nombre y el archivo se perdía)
+# -------------------------
+ADJUNTO_PDF_MAX_BYTES = 2 * 1024 * 1024
+
+def guardar_adjunto_aviso(aviso_id: str, adjunto) -> str:
+    """Guarda el adjunto del aviso y lo respalda en Google Sheets (FotosData), igual que las
+    fotos de los reportes, para que sobreviva a un reinicio. Devuelve el nombre guardado."""
+    if adjunto is None:
+        return ""
+    if adjunto.name.lower().endswith(".pdf"):
+        if adjunto.size > ADJUNTO_PDF_MAX_BYTES:
+            return ""  # ya se avisó en pantalla; el aviso se guarda sin el PDF
+        nombre = f"adj_{re.sub(r'[^A-Za-z0-9._-]', '_', adjunto.name)}"
+        ruta = _ruta_foto_local(aviso_id, nombre)
+        os.makedirs(os.path.dirname(ruta), exist_ok=True)
+        with open(ruta, "wb") as f:
+            f.write(adjunto.getbuffer())
+        _respaldar_fotos_sheets(aviso_id, [(nombre, ruta)])
+        return nombre
+    guardadas = _guardar_fotos_evidencia(aviso_id, "adj", [adjunto])  # comprime y respalda
+    return guardadas[0][0] if guardadas else ""
+
+def mostrar_adjunto_aviso(row):
+    """Muestra el adjunto del aviso (foto o botón de descarga del PDF), recuperándolo desde
+    Sheets si ya no está en el disco. Avisos antiguos: solo había nombre, sin archivo."""
+    nombre = str(row.get("Adjunto") or "").strip()
+    if not nombre or nombre.lower() == "nan":
+        return
+    aviso_id = str(row["AvisoID"])
+    _restaurar_fotos_desde_sheets([(aviso_id, nombre)])
+    ruta = _ubicar_foto(aviso_id, nombre)
+    if not ruta:
+        st.caption(f"📎 Adjunto: {nombre} (archivo no disponible)")
+    elif nombre.lower().endswith(".pdf"):
+        with open(ruta, "rb") as f:
+            st.download_button(f"📎 Descargar adjunto ({nombre[4:] if nombre.startswith('adj_') else nombre})",
+                               data=f.read(), file_name=nombre, mime="application/pdf", key=f"adj_{aviso_id}")
+    else:
+        st.image(ruta, caption="📎 Adjunto", width="stretch")
+
 def render_aviso_row(row):
+    descripcion = texto_con_fechas(row["Descripcion"])
+    te_toca = st.session_state.get("perfil") in ROLES_VALIDADORES and can_validate(st.session_state.perfil, row)
     st.markdown(
         f"""<div class="aviso-row">
-                <div class="aviso-title">{row['Activo']}</div>
-                <div class="aviso-desc">{row['Descripcion'][:90]}{'...' if len(row['Descripcion']) > 90 else ''}</div>
-                <div class="aviso-meta">📄 {row['AvisoID']} · {row['FechaHora']} &nbsp; 🕐 {elapsed_str(row['FechaHora'])}</div>
+                <div class="aviso-title">{html_escape(str(row['Activo']))}{' &nbsp;<span class="pill" style="background:#E0A458;color:#fff;">🔔 Te toca aprobar</span>' if te_toca else ''}</div>
+                <div class="aviso-desc">{html_escape(descripcion[:90])}{'...' if len(descripcion) > 90 else ''}</div>
+                <div class="aviso-meta">📄 {html_escape(str(row['AvisoID']))} · {html_escape(str(row['FechaHora']))} &nbsp; 🕐 {elapsed_str(row['FechaHora'])}</div>
+                {_html_aprobaciones(row)}
             </div>""",
         unsafe_allow_html=True,
     )
@@ -2757,7 +3245,7 @@ def inspecciones_filtradas(fecha_str: str | None = None, usuario: str | None = N
 # El borrador de cada collera (cd_borradores) es una lista de 23 con "Malo" o None.
 
 def _cd_fecha_str() -> str:
-    fecha = st.session_state.get("cd_fecha") or st.session_state.get("cd_fecha_mem") or datetime.now().date()
+    fecha = st.session_state.get("cd_fecha") or st.session_state.get("cd_fecha_mem") or ahora().date()
     return fecha.strftime("%Y-%m-%d")
 
 def _cd_malos(secuencia) -> list:
@@ -2786,7 +3274,11 @@ def _cd_pendiente(collera_id: str, guardadas: dict | None = None) -> bool:
     borradores = st.session_state.get("cd_borradores", {})
     if collera_id not in borradores:
         return False
-    guardadas = _cd_guardadas_hoy() if guardadas is None else guardadas
+    if guardadas is None:
+        try:
+            guardadas = _cd_guardadas_hoy()
+        except Exception:  # sin conexión: se usa lo guardado en esta sesión (corre en callbacks)
+            guardadas = st.session_state.get("cd_guardadas", {}).get(_cd_fecha_str(), {})
     return collera_id not in guardadas or _cd_malos(borradores[collera_id]) != _cd_malos(guardadas[collera_id])
 
 def _cd_secuencia_final(collera_id: str) -> list:
@@ -2855,7 +3347,7 @@ def page_control_durmientes_terreno():
 
     # Streamlit borra el valor de los widgets al salir de la pantalla: se recuerda aparte
     # (en *_mem) para que al volver siga en el mismo PK, collera y fecha.
-    for clave, por_defecto in (("cd_pk", 33), ("cd_fecha", datetime.now().date()), ("cd_sel", None)):
+    for clave, por_defecto in (("cd_pk", 33), ("cd_fecha", ahora().date()), ("cd_sel", None)):
         if clave not in st.session_state and st.session_state.get(f"{clave}_mem", por_defecto) is not None:
             st.session_state[clave] = st.session_state.get(f"{clave}_mem", por_defecto)
     c1, c2 = st.columns(2)
@@ -3112,7 +3604,7 @@ def reconciliar_avisos_faltantes() -> int:
         ubicacion = ubicacion if isinstance(ubicacion, str) and ubicacion.strip() else ""
         crear_aviso_desde_reporte(
             str(rep["ReporteID"]), str(rep.get("GrupoVia") or ""), ubicacion,
-            f"Reporte Diario recuperado del histórico ({rep.get('Fecha')}).",
+            f"Reporte Diario recuperado del histórico ({str(_fecha_desde_serial(rep.get('Fecha')))[:10]}).",
             creado_por=rep.get("Usuario") or "Personal Terreno",
         )
     return len(faltantes)
@@ -3229,6 +3721,7 @@ def guardar_reporte(grupo_via, fecha_reporte, ubicacion, observaciones, fotos_su
     except Exception:
         print(traceback.format_exc(), flush=True)
         resumen["aviso_id"] = "(pendiente: se puede recuperar desde Avanzado)"
+    resumen["aprobaciones"] = aprobaciones_de_reporte(reporte_id)  # recién creado: ambas «Pendiente»
     try:
         excel_bytes, pdf_bytes = generar_documentos_reporte(resumen)
     except Exception:
@@ -3245,7 +3738,7 @@ def page_generar_reporte():
     st.markdown("#### Datos generales")
     c1, c2 = st.columns(2)
     recordar_widget("rep_grupo_via")
-    recordar_widget("rep_fecha", datetime.now().date())
+    recordar_widget("rep_fecha", ahora().date())
     with c1:
         grupo_via = st.selectbox("Grupo Vía", GRUPOS_VIA, key="rep_grupo_via")
     with c2:
@@ -3470,8 +3963,13 @@ def terreno_inicio():
     df = st.session_state.avisos
     mios = df[df["CreadoPor"] == st.session_state.usuario]
     pend = int(mios[mios["Estado"].isin(["Nuevo", "En validación", "Observado"])].shape[0])
+    n_obs = int((mios["Estado"] == "Observado").sum())
+    n_rech = int((mios["Estado"] == "Rechazado").sum())
 
     st.markdown("### Bienvenido")
+    if n_obs or n_rech:
+        partes = ([f"**{n_obs}** observado(s)"] if n_obs else []) + ([f"**{n_rech}** rechazado(s)"] if n_rech else [])
+        st.warning(f"🔔 Tienes {' y '.join(partes)}. Revísalos en «Mis Avisos».")
     c1, c2 = st.columns(2)
     with c1:
         if st.button("➕  Crear Incidencia", key="btn_crear_aviso"):
@@ -3505,18 +4003,26 @@ def terreno_mis_reportes():
         st.info("Aún no has enviado Reportes Diarios.")
         return
     mios = mios.sort_values(["Fecha", "ReporteID"], ascending=False, key=lambda s: s.astype(str))
+    mios = mios.assign(_mes=mios["Fecha"].map(_mes_de))
     st.caption(f"{len(mios)} reporte(s) enviados.")
-    for _, rep in mios.iterrows():
-        rid = str(rep["ReporteID"])
-        colA, colB = st.columns([4, 1])
-        with colA:
-            st.markdown(f"**{rid}** · {rep['Fecha']}")
-            st.caption(f"Grupo Vía {rep['GrupoVia']} · creado {rep.get('FechaCreacion', '')}")
-        with colB:
-            if st.button("Ver ›", key=f"ver_rep_{rid}"):
-                st.session_state.selected_reporte = rid
-                st.session_state.page = "Detalle Reporte"
-                st.rerun()
+    # Agrupados por mes (según la Fecha del reporte; vale también para los ya guardados),
+    # el más reciente abierto.
+    for i, mes in enumerate(sorted(mios["_mes"].unique(), reverse=True)):
+        del_mes = mios[mios["_mes"] == mes]
+        with st.expander(f"📅 {nombre_mes(mes)} · {len(del_mes)} reporte(s)", expanded=(i == 0)):
+            for _, rep in del_mes.iterrows():
+                rid = str(rep["ReporteID"])
+                colA, colB = st.columns([4, 1])
+                with colA:
+                    st.markdown(f"**{rid}** · {rep['Fecha']}")
+                    sacyr, adi = aprobaciones_de_reporte(rid)
+                    st.caption(f"Grupo Vía {rep['GrupoVia']} · creado {rep.get('FechaCreacion', '')} · "
+                               f"SACYR: {sacyr['estado']} · ADI: {adi['estado']}")
+                with colB:
+                    if st.button("Ver ›", key=f"ver_rep_{rid}"):
+                        st.session_state.selected_reporte = rid
+                        st.session_state.page = "Detalle Reporte"
+                        st.rerun()
 
 def terreno_detalle_reporte():
     app_header("Detalle Reporte", back_page="Mis Reportes")
@@ -3543,6 +4049,10 @@ def terreno_mis_avisos():
             render_aviso_row(row)
         with colB:
             badge(row["Estado"], estado_kind.get(row["Estado"], "info"))
+        adjunto = str(row.get("Adjunto") or "").strip()
+        if adjunto and adjunto.lower() != "nan":
+            with st.expander("📎 Ver adjunto"):
+                mostrar_adjunto_aviso(row)
         if row["Estado"] == "Observado":
             obs = row["ObsSacyr"] or row["ObsADI"] or row["ObsEFE"] or row.get("ObsSubcontrato", "")
             if obs:
@@ -3591,7 +4101,7 @@ def flujo_terreno():
 def validador_inicio():
     app_header("Inicio", right_icon="💬")
     perfil_bar()
-    dfA = st.session_state.avisos
+    dfA = avisos_visibles(st.session_state.perfil, st.session_state.avisos)
     pend = int(dfA[~dfA["Estado"].isin(["OT creada", "Cerrado", "Rechazado"])].shape[0]) if not dfA.empty else 0
     ots_prog = int((st.session_state.ots["EstadoOT"] != "Cerrada").sum()) if not st.session_state.ots.empty else 0
 
@@ -3599,7 +4109,9 @@ def validador_inicio():
     if st.button("➕  Crear Aviso", key="btn_crear_aviso"):
         st.session_state.page = "Crear Aviso"
         st.rerun()
-    if st.button(f"ℹ️  Backlog de Avisos\n{pend} Pendientes", key="btn_backlog_avisos"):
+    n_por_aprobar = len(avisos_por_aprobar(st.session_state.perfil, dfA)) if not dfA.empty else 0
+    etiqueta_backlog = f"ℹ️  Backlog de Avisos\n{pend} Pendientes" + (f" · 🔔 {n_por_aprobar} por aprobar" if n_por_aprobar else "")
+    if st.button(etiqueta_backlog, key="btn_backlog_avisos"):
         st.session_state.page = "Backlog"
         st.rerun()
     if st.button(f"🔧  Backlog de OTs\n{ots_prog} Programadas", key="btn_backlog_ots"):
@@ -3617,45 +4129,51 @@ def validador_inicio():
     if st.button("📊  Reportes (Demo)", key="btn_reportes"):
         st.info("Próximamente: dashboard de KPIs.")
 
-    st.markdown("##### Descargar histórico completo")
-    # Se genera a pedido (no en cada recarga de Inicio): arma el Excel y el PDF de todo el
-    # histórico y junta las fotos, recuperando desde Sheets las que falten en el disco.
-    if st.button("📦  Preparar descarga del histórico", key="btn_preparar_respaldo"):
+    st.markdown("##### Descargar histórico")
+    # Todo el histórico o un mes (para el Estado de Pago). El mes sale de la Fecha de cada
+    # reporte, así que incluye también los reportes ya guardados. Se genera a pedido.
+    try:
+        opciones_periodo = ["Todo el histórico"] + meses_con_reportes()
+    except Exception:
+        opciones_periodo = ["Todo el histórico"]
+    periodo = st.selectbox("Período", opciones_periodo, key="respaldo_periodo",
+                           format_func=lambda p: p if p == "Todo el histórico" else nombre_mes(p))
+    anio_mes = (None, None) if periodo == "Todo el histórico" else (int(periodo[:4]), int(periodo[5:7]))
+    if st.button("📦  Preparar descarga", key="btn_preparar_respaldo"):
         with st.spinner("Leyendo el histórico desde Google Sheets..."):
-            st.session_state.respaldo_excel = generar_respaldo_plano()
-            st.session_state.respaldo_pdf = generar_respaldo_pdf()
-            st.session_state.respaldo_fotos_zip = generar_respaldo_fotos_zip()
-            st.session_state.respaldo_generado = now_str()
-    if st.session_state.get("respaldo_generado"):
-        st.caption(f"Histórico preparado el {st.session_state.respaldo_generado}.")
-        if not (st.session_state.respaldo_excel or st.session_state.respaldo_fotos_zip):
-            st.info("Todavía no hay Reportes Diarios en el histórico.")
+            st.session_state.respaldo = {
+                "periodo": periodo,
+                "excel": generar_respaldo_plano(*anio_mes),
+                "pdf": generar_respaldo_pdf(*anio_mes),
+                "zip": generar_respaldo_fotos_zip(*anio_mes),
+                "generado": now_str(),
+                "archivos": (nombre_archivo_respaldo("xlsx", *anio_mes), nombre_archivo_respaldo("pdf", *anio_mes),
+                             nombre_archivo_respaldo("zip", *anio_mes, prefijo="fotos")),
+            }
+    respaldo = st.session_state.get("respaldo")
+    if respaldo and respaldo["periodo"] == periodo:
+        st.caption(f"{'Histórico completo' if periodo == 'Todo el histórico' else nombre_mes(periodo)} "
+                   f"preparado el {respaldo['generado']}.")
+        if not (respaldo["excel"] or respaldo["zip"]):
+            st.info("No hay Reportes Diarios en este período.")
         col_excel, col_pdf, col_fotos = st.columns(3)
         with col_excel:
-            if st.session_state.respaldo_excel:
+            if respaldo["excel"]:
                 st.download_button(
-                    "💾  Excel",
-                    data=st.session_state.respaldo_excel,
-                    file_name="reportes_diarios_respaldo.xlsx",
+                    "💾  Excel", data=respaldo["excel"], file_name=respaldo["archivos"][0],
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="btn_backup_reportes", width="stretch",
                 )
         with col_pdf:
-            if st.session_state.respaldo_pdf:
+            if respaldo["pdf"]:
                 st.download_button(
-                    "📄  PDF",
-                    data=st.session_state.respaldo_pdf,
-                    file_name="reportes_diarios_respaldo.pdf",
-                    mime="application/pdf",
+                    "📄  PDF", data=respaldo["pdf"], file_name=respaldo["archivos"][1], mime="application/pdf",
                     key="btn_backup_reportes_pdf", width="stretch",
                 )
         with col_fotos:
-            if st.session_state.respaldo_fotos_zip:
+            if respaldo["zip"]:
                 st.download_button(
-                    "🖼️  Fotos (ZIP)",
-                    data=st.session_state.respaldo_fotos_zip,
-                    file_name="reportes_diarios_fotos.zip",
-                    mime="application/zip",
+                    "🖼️  Fotos (ZIP)", data=respaldo["zip"], file_name=respaldo["archivos"][2], mime="application/zip",
                     key="btn_backup_fotos", width="stretch",
                 )
 
@@ -3694,26 +4212,113 @@ def render_avanzado_sacyr():
             else:
                 st.info("No hay fotos locales pendientes de respaldar (o Google Sheets no está configurado).")
 
+def validar_aviso(aviso_id: str, accion: str, obs: str = "") -> str:
+    """Aprueba, observa o rechaza un aviso con el perfil actual (se usa desde el Backlog).
+    Devuelve el mensaje para mostrar. Lanza ErrorGuardadoSheets si no se pudo guardar."""
+    role = st.session_state.perfil
+    df = st.session_state.avisos
+    mascara = df["AvisoID"] == aviso_id
+    row = df[mascara].iloc[0].to_dict()
+    if not can_validate(role, row):  # p.ej. otro usuario ya lo validó mientras tanto
+        return f"⚠️ El aviso {aviso_id} ya no está esperando tu validación."
+    rol_final = row.get("RolFinal") or "EFE"
+    col_aprob, col_obs, col_fecha, col_resp = final_cols(rol_final)
+    columnas = {"Sacyr": ("AprobadoSacyr", "ObsSacyr", "FechaValSacyr", "RespValSacyr"),
+                "ADI (ITO)": ("AprobadoADI", "ObsADI", "FechaValADI", "RespValADI")}.get(role, (col_aprob, col_obs, col_fecha, col_resp))
+    if accion == "aprobar":
+        st.session_state.avisos.loc[mascara, list(columnas)] = [True, obs, now_str(), st.session_state.usuario]
+        move_to_next_level(aviso_id, role)
+        mensaje = f"✅ {aviso_id} aprobado."
+    elif accion == "observar":
+        st.session_state.avisos.loc[mascara, ["Estado", "ValidacionNivel", columnas[1]]] = ["Observado", "Sacyr", obs]
+        mensaje = f"🟨 {aviso_id} observado: vuelve a Sacyr."
+    else:
+        st.session_state.avisos.loc[mascara, ["Estado", columnas[1]]] = ["Rechazado", obs]
+        mensaje = f"⛔ {aviso_id} rechazado."
+    save_all_avisos()
+    return mensaje
+
+def acciones_validacion_backlog(aviso_id: str):
+    """Botones de validación en la fila del Backlog (sin entrar al aviso). Observar y
+    rechazar piden un comentario: es lo que el jefe de grupo ve como motivo."""
+    with st.container(key=f"accav_{aviso_id}"):
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("✅ Aprobar", key=f"apr_{aviso_id}", width="stretch"):
+                st.session_state.backlog_mensaje = validar_aviso(aviso_id, "aprobar")
+                st.rerun()
+        with c2:
+            with st.popover("🟨 Observar / ⛔ Rechazar", width="stretch"):
+                comentario = st.text_area("Comentario (obligatorio)", key=f"com_{aviso_id}", height=80,
+                                          placeholder="Ej: falta la asistencia del día")
+                o1, o2 = st.columns(2)
+                for col, accion, etiqueta in ((o1, "observar", "🟨 Observar"), (o2, "rechazar", "⛔ Rechazar")):
+                    with col:
+                        if st.button(etiqueta, key=f"{accion}_{aviso_id}", width="stretch"):
+                            if not comentario.strip():
+                                st.error("Escribe el comentario.")
+                            else:
+                                st.session_state.backlog_mensaje = validar_aviso(aviso_id, accion, comentario.strip())
+                                st.rerun()
+
 def validador_backlog():
     app_header("Backlog de Avisos", back_page="Inicio", right_icon="➕")
     perfil_bar()
-    df = st.session_state.avisos.copy()
+    mensaje = st.session_state.pop("backlog_mensaje", None)
+    if mensaje:
+        (st.warning if mensaje.startswith("⚠️") else st.success)(mensaje)
+    perfil = st.session_state.perfil
+    df = avisos_visibles(perfil, st.session_state.avisos.copy())
+    if perfil == "EFE":
+        st.caption("Como EFE ves solo las incidencias: los avisos de Reportes Diarios los valida el Supervisor Subcontrato.")
+    fechas_rep = fechas_de_reportes()  # una sola lectura para todos los avisos
+    df = df.assign(_mes=[mes_de_aviso(f, fechas_rep) for f in df.to_dict("records")]) if not df.empty else df.assign(_mes=[])
+    por_aprobar = avisos_por_aprobar(perfil, df)
+    ids_por_aprobar = set(por_aprobar["AvisoID"].astype(str)) if not por_aprobar.empty else set()
+    por_aprobar_mes = por_aprobar["_mes"].value_counts().to_dict() if not por_aprobar.empty else {}
+    if not por_aprobar.empty:
+        desglose = " · ".join(f"{nombre_mes(m)}: {n}" for m, n in sorted(por_aprobar_mes.items(), reverse=True))
+        st.warning(f"🔔 Tienes **{len(por_aprobar)}** aviso(s) esperando tu aprobación — {desglose}")
+
+    # Selector de mes: con muchos avisos, cargar solo un mes hace la pantalla legible y rápida.
+    meses = sorted({m for m in df["_mes"] if m}, reverse=True) if not df.empty else []
+    opciones = meses + ["Todos los meses"]
+    total_mes = df["_mes"].value_counts().to_dict() if not df.empty else {}
+    mes_sel = st.selectbox(
+        "Mes", opciones, key="backlog_mes",
+        format_func=lambda m: "Todos los meses" if m == "Todos los meses" else
+        f"{nombre_mes(m)} · {total_mes.get(m, 0)} aviso(s)" + (f" · 🔔 {por_aprobar_mes[m]} por aprobar" if por_aprobar_mes.get(m) else ""),
+    )
+    if mes_sel != "Todos los meses":
+        df = df[df["_mes"] == mes_sel]
+    if st.toggle("Ver solo los que me tocan", key="backlog_solo_mios"):
+        df = df[df["AvisoID"].astype(str).isin(ids_por_aprobar)]
     tab1, tab2, tab3 = st.tabs(["Pendientes", "OT Creada", "Cerrados"])
 
     def render_list(filtered_df):
         if filtered_df.empty:
             st.info("No hay registros para mostrar.")
             return
-        for _, row in filtered_df.iterrows():
-            colA, colB = st.columns([5, 1])
-            with colA:
-                render_aviso_row(row)
-            with colB:
-                badge(row["Prioridad"], priority_kind(row["Prioridad"]))
-                if st.button("Ver ›", key=f"ver_{row['AvisoID']}"):
-                    st.session_state.selected_aviso = row["AvisoID"]
-                    st.session_state.page = "Detalle"
-                    st.rerun()
+        meses_lista = sorted(filtered_df["_mes"].unique(), reverse=True)
+        for i, mes in enumerate(meses_lista):
+            del_mes = filtered_df[filtered_df["_mes"] == mes].sort_values("FechaHora", ascending=False)
+            n_mios = int(del_mes["AvisoID"].astype(str).isin(ids_por_aprobar).sum())
+            titulo = f"📅 {nombre_mes(mes)} · {len(del_mes)} aviso(s)" + (f" · 🔔 {n_mios} por aprobar" if n_mios else "")
+            # Solo el mes más reciente abierto: abrir todos los meses con avisos por aprobar
+            # dejaba la pantalla con cientos de avisos seguidos y no se notaba la agrupación.
+            with st.expander(titulo, expanded=(i == 0)):
+                for _, row in del_mes.iterrows():
+                    colA, colB = st.columns([5, 1])
+                    with colA:
+                        render_aviso_row(row)
+                    with colB:
+                        badge(row["Prioridad"], priority_kind(row["Prioridad"]))
+                        if st.button("Ver ›", key=f"ver_{row['AvisoID']}"):
+                            st.session_state.selected_aviso = row["AvisoID"]
+                            st.session_state.page = "Detalle"
+                            st.rerun()
+                    if str(row["AvisoID"]) in ids_por_aprobar:
+                        acciones_validacion_backlog(str(row["AvisoID"]))
 
     with tab1:
         render_list(df[~df["Estado"].isin(["OT creada", "Cerrado", "Rechazado"])])
@@ -3763,8 +4368,7 @@ def validador_detalle():
             **Tipificación:** {row['Tipificacion']}
             """
         )
-        if row["Adjunto"]:
-            st.caption(f"📎 Adjunto: {row['Adjunto']}")
+        mostrar_adjunto_aviso(row)
         if tiene_reporte:
             st.caption(f"🔗 Vinculado al Reporte Diario {row['ReporteID']} · ver pestaña 'Ver Reporte Diario'")
         st.caption(f"📄 {row['AvisoID']} · {row['FechaHora']} &nbsp; 🕐 {elapsed_str(row['FechaHora'])}")
@@ -3778,48 +4382,21 @@ def validador_detalle():
         c1, c2, c3 = st.columns(3)
         with c1:
             badge("Sacyr", "ok" if row["AprobadoSacyr"] else "muted")
-            st.caption(row["FechaValSacyr"] or "—")
+            st.caption(" · ".join(x for x in (row["FechaValSacyr"], row["RespValSacyr"]) if isinstance(x, str) and x) or "—")
         with c2:
             badge("ADI (ITO)", "ok" if row["AprobadoADI"] else "muted")
-            st.caption(row["FechaValADI"] or "—")
+            st.caption(" · ".join(x for x in (row["FechaValADI"], row["RespValADI"]) if isinstance(x, str) and x) or "—")
         with c3:
             badge(rol_final, "ok" if row[col_aprob] else "muted")
-            st.caption(row[col_fecha] or "—")
+            st.caption(" · ".join(x for x in (row[col_fecha], row[col_resp]) if isinstance(x, str) and x) or "—")
 
         st.write("")
         role = st.session_state.perfil
-        can_do = can_validate(role, row)
-        obs = st.text_area("Observación / comentario", height=80, key=f"obs_{aviso_id}_{role}")
-
-        obs_col_map = {"Sacyr": "ObsSacyr", "ADI (ITO)": "ObsADI", rol_final: col_obs_name}
-
-        colA, colB, colC = st.columns(3)
-        with colA:
-            if st.button("✅ Aprobar", disabled=not can_do, key="btn_aprobar"):
-                if role == "Sacyr":
-                    st.session_state.avisos.loc[df["AvisoID"] == aviso_id, ["AprobadoSacyr", "ObsSacyr", "FechaValSacyr", "RespValSacyr"]] = [True, obs, now_str(), st.session_state.usuario]
-                elif role == "ADI (ITO)":
-                    st.session_state.avisos.loc[df["AvisoID"] == aviso_id, ["AprobadoADI", "ObsADI", "FechaValADI", "RespValADI"]] = [True, obs, now_str(), st.session_state.usuario]
-                elif role == rol_final:
-                    st.session_state.avisos.loc[df["AvisoID"] == aviso_id, [col_aprob, col_obs_name, col_fecha, col_resp]] = [True, obs, now_str(), st.session_state.usuario]
-                move_to_next_level(aviso_id, role)
-                save_all_avisos()
-                st.success("Aprobación registrada ✅")
-                st.rerun()
-        with colB:
-            if st.button("🟨 Observar", disabled=not can_do, key="btn_observar"):
-                st.session_state.avisos.loc[df["AvisoID"] == aviso_id, "Estado"] = "Observado"
-                st.session_state.avisos.loc[df["AvisoID"] == aviso_id, "ValidacionNivel"] = "Sacyr"
-                st.session_state.avisos.loc[df["AvisoID"] == aviso_id, obs_col_map[role]] = obs
-                save_all_avisos()
-                st.warning("Aviso observado. Vuelve a Sacyr para completar información.")
-                st.rerun()
-        with colC:
-            if st.button("⛔ Rechazar", disabled=not can_do, key="btn_rechazar"):
-                st.session_state.avisos.loc[df["AvisoID"] == aviso_id, "Estado"] = "Rechazado"
-                st.session_state.avisos.loc[df["AvisoID"] == aviso_id, obs_col_map[role]] = obs
-                save_all_avisos()
-                st.error("Aviso rechazado.")
+        # El detalle es solo para revisar: aprobar, observar y rechazar se hacen desde el Backlog.
+        if can_validate(role, row):
+            st.info("🔔 Te toca validar este aviso. Revísalo aquí y apruébalo, obsérvalo o recházalo desde el **Backlog**.")
+            if st.button("↩ Volver al Backlog para validar", key="btn_volver_backlog_validar"):
+                st.session_state.page = "Backlog"
                 st.rerun()
 
         st.divider()
@@ -3847,8 +4424,8 @@ def validador_detalle():
         else:
             with st.form("form_ot"):
                 responsable = st.selectbox("Responsable", RESPONSABLES_OT)
-                fecha_prog_d = st.date_input("Fecha Programada (día)", datetime.now().date())
-                fecha_prog_t = st.time_input("Hora Programada", datetime.now().time().replace(second=0, microsecond=0))
+                fecha_prog_d = st.date_input("Fecha Programada (día)", ahora().date())
+                fecha_prog_t = st.time_input("Hora Programada", ahora().time().replace(second=0, microsecond=0))
                 submitted_ot = st.form_submit_button("Iniciar OT", key="btn_iniciar_ot")
             if submitted_ot:
                 fecha_prog = datetime.combine(fecha_prog_d, fecha_prog_t)
@@ -3914,7 +4491,7 @@ def _guardar_fotos_evidencia(carpeta_id: str, prefijo: str, archivos) -> list:
         return guardadas
     carpeta = os.path.join(FOTOS_DIR, carpeta_id)
     os.makedirs(carpeta, exist_ok=True)
-    marca = datetime.now().strftime("%Y%m%d%H%M%S")
+    marca = ahora().strftime("%Y%m%d%H%M%S")
     for i, archivo in enumerate(archivos, start=1):
         nombre = f"{prefijo}_{marca}_{i:02d}.jpg"
         ruta = os.path.join(carpeta, nombre)
@@ -4044,9 +4621,11 @@ def tarjeta_ot(r: dict):
             with b1:
                 if r["EstadoOT"] == "Programada":
                     if st.button("▶ Iniciar", key=f"exec_{ot_id}", width="stretch"):
-                        if registrar_en_bitacora(r, "Inicio de ejecución", "En ejecución"):
-                            st.session_state.ots.loc[st.session_state.ots["OTID"] == ot_id, "EstadoOT"] = "En ejecución"
-                            save_all_ots()
+                        if not registrar_en_bitacora(r, "Inicio de ejecución", "En ejecución"):
+                            # Sin registro en la bitácora no se cambia el estado (antes se ignoraba en silencio).
+                            raise ErrorGuardadoSheets(f"No se pudo registrar el inicio de {ot_id} en la bitácora.")
+                        st.session_state.ots.loc[st.session_state.ots["OTID"] == ot_id, "EstadoOT"] = "En ejecución"
+                        save_all_ots()
                         st.rerun()
                 else:
                     if st.button("📝 Avance", key=f"avance_{ot_id}", width="stretch"):
@@ -4127,7 +4706,7 @@ def page_planificacion():
             except Exception as e:
                 st.error(f"No se pudo leer el archivo: {e}")
 
-    hoy = datetime.now()
+    hoy = ahora()
     c1, c2 = st.columns(2)
     with c1:
         anio = st.selectbox("Año", [2025, 2026, 2027], index=1, key="plan_anio")
@@ -4369,7 +4948,7 @@ def page_control_colleras():
     )
 
     if st.button("💾 Guardar cambios de este PK", key="btn_guardar_control_colleras", width="stretch"):
-        fecha_str = datetime.now().strftime("%Y-%m-%d")
+        fecha_str = ahora().strftime("%Y-%m-%d")
         reporte_ajuste = f"AJUSTE-MANUAL-{st.session_state.usuario}"
         secuencias = {
             fila["Collera"]: [v if isinstance(v, str) and v else None for v in (fila.get(f"D{p}") for p in range(1, 24))]
@@ -4460,11 +5039,23 @@ sincronizar_historial_navegador()
 def mostrar_error_amigable(error: Exception):
     detalle = traceback.format_exc()
     print(f"[ERROR {now_str()}] página={st.session_state.get('page')} usuario={st.session_state.get('usuario')}\n{detalle}", flush=True)
-    st.error(
-        "⚠️ Ocurrió un problema al mostrar esta pantalla. **Lo que ya estaba guardado no se perdió** "
-        "y lo que tenías sin guardar sigue respaldado en este celular. Prueba reintentar o volver al Inicio; "
-        "si se repite, avisa al administrador con el detalle de abajo."
-    )
+    if isinstance(error, ErrorGuardadoSheets):
+        # Distinto del caso general: acá el cambio NO quedó guardado y hay que repetirlo.
+        st.error(
+            "⛔ **El cambio NO quedó guardado.** No se pudo escribir en Google Sheets (sin conexión o "
+            "Google no respondió). Repite la acción en un momento; si se repite, avisa al administrador."
+        )
+    elif isinstance(error, ErrorConexionSheets):
+        st.error(
+            "⚠️ No se pudo conectar con Google Sheets para mostrar esta pantalla. No se guardó ningún "
+            "cambio desde aquí. Prueba reintentar en un momento."
+        )
+    else:
+        st.error(
+            "⚠️ Ocurrió un problema al mostrar esta pantalla. **Lo que ya estaba guardado no se perdió** "
+            "y lo que tenías sin guardar sigue respaldado en este celular. Prueba reintentar o volver al Inicio; "
+            "si se repite, avisa al administrador con el detalle de abajo."
+        )
     c1, c2 = st.columns(2)
     with c1:
         if st.button("🔄 Reintentar", key="btn_error_reintentar", width="stretch"):
